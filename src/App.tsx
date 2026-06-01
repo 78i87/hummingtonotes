@@ -23,6 +23,7 @@ import {
 import { cleanupArticulation } from './lib/articulation'
 import { createMidiBlob } from './lib/midi'
 import { adjustNotes, defaultSettings, inferKey } from './lib/music'
+import { cleanupNoiseArtifacts } from './lib/noise'
 import { playPianoNotes, type PlaybackHandle } from './lib/playback'
 import { KEYS, SCALES } from './lib/types'
 import type {
@@ -39,7 +40,53 @@ const GRID_OPTIONS = [
   { value: 0.125, label: '1/32' },
 ]
 
+const CORRECTION_PRESETS = [
+  {
+    id: 'light',
+    label: 'Light',
+    description: 'Keeps repeated notes and expressive timing.',
+    settings: {
+      noiseCleanup: 0.35,
+      articulationCleanup: 0.3,
+      correctionStrength: 0.55,
+      quantizeStrength: 0.35,
+    },
+  },
+  {
+    id: 'balanced',
+    label: 'Balanced',
+    description: 'Best default for hum, la, or du melodies.',
+    settings: {
+      noiseCleanup: 0.7,
+      articulationCleanup: 0.7,
+      correctionStrength: 0.85,
+      quantizeStrength: 0.75,
+    },
+  },
+  {
+    id: 'noisy',
+    label: 'Noisy room',
+    description: 'Stronger cleanup for short high or low blips.',
+    settings: {
+      noiseCleanup: 0.9,
+      articulationCleanup: 0.78,
+      correctionStrength: 0.85,
+      quantizeStrength: 0.75,
+    },
+  },
+] as const
+
+const DEFAULT_PRESET_ID = 'balanced'
+const PRESET_SETTING_KEYS: Array<keyof AnalysisSettings> = [
+  'noiseCleanup',
+  'articulationCleanup',
+  'correctionStrength',
+  'quantizeStrength',
+]
+
 type AppStatus = 'idle' | 'ready' | 'recording' | 'analyzing' | 'complete'
+type CorrectionPresetId = (typeof CORRECTION_PRESETS)[number]['id']
+type ActivePreset = CorrectionPresetId | 'custom'
 
 const initialSettings = defaultSettings({
   key: 'C',
@@ -59,6 +106,8 @@ function App() {
   const [progress, setProgress] = useState(0)
   const [error, setError] = useState('')
   const [isPlayingMidi, setIsPlayingMidi] = useState(false)
+  const [activePreset, setActivePreset] =
+    useState<ActivePreset>(DEFAULT_PRESET_ID)
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
   const chunksRef = useRef<Blob[]>([])
   const playbackRef = useRef<PlaybackHandle | null>(null)
@@ -68,22 +117,27 @@ function App() {
       inferKey(
         rawTranscription
           ? cleanupArticulation(
-              rawTranscription.notes,
+              cleanupNoiseArtifacts(
+                rawTranscription.notes,
+                settings.noiseCleanup,
+              ).notes,
               settings.articulationCleanup,
             ).notes
           : [],
       ),
-    [rawTranscription, settings.articulationCleanup],
+    [rawTranscription, settings.articulationCleanup, settings.noiseCleanup],
+  )
+  const denoisedMelody = useMemo(
+    () =>
+      rawTranscription
+        ? cleanupNoiseArtifacts(rawTranscription.notes, settings.noiseCleanup)
+        : { notes: [], removedCount: 0, originalCount: 0 },
+    [rawTranscription, settings.noiseCleanup],
   )
   const cleanedMelody = useMemo(
     () =>
-      rawTranscription
-        ? cleanupArticulation(
-            rawTranscription.notes,
-            settings.articulationCleanup,
-          )
-        : { notes: [], mergedCount: 0, originalCount: 0 },
-    [rawTranscription, settings.articulationCleanup],
+      cleanupArticulation(denoisedMelody.notes, settings.articulationCleanup),
+    [denoisedMelody.notes, settings.articulationCleanup],
   )
   const adjustedNotes = useMemo(
     () =>
@@ -165,16 +219,21 @@ function App() {
       setProgress(0)
       const { transcribeWithBasicPitch } = await import('./lib/transcription')
       const raw = await transcribeWithBasicPitch(source.buffer, setProgress)
-      const cleaned = cleanupArticulation(
+      const denoised = cleanupNoiseArtifacts(
         raw.notes,
-        initialSettings.articulationCleanup,
+        settings.noiseCleanup,
+      )
+      const cleaned = cleanupArticulation(
+        denoised.notes,
+        settings.articulationCleanup,
       )
       const suggestion = inferKey(cleaned.notes)
       setRawTranscription(raw)
       setManualEdits({})
       setSettings((current) => ({
-        ...defaultSettings(suggestion),
-        exportPitchBends: current.exportPitchBends,
+        ...current,
+        key: suggestion.key,
+        scale: suggestion.scale,
       }))
       setStatus('complete')
     } catch (analysisError) {
@@ -230,14 +289,35 @@ function App() {
     key: K,
     value: AnalysisSettings[K],
   ) {
-    if (key === 'articulationCleanup') {
+    if (key === 'articulationCleanup' || key === 'noiseCleanup') {
       stopMidiPlayback()
       setManualEdits({})
+    }
+
+    if (PRESET_SETTING_KEYS.includes(key)) {
+      setActivePreset('custom')
     }
 
     setSettings((current) => ({
       ...current,
       [key]: value,
+    }))
+  }
+
+  function applyCorrectionPreset(presetId: CorrectionPresetId) {
+    const preset = CORRECTION_PRESETS.find(
+      (candidate) => candidate.id === presetId,
+    )
+    if (!preset) {
+      return
+    }
+
+    stopMidiPlayback()
+    setManualEdits({})
+    setActivePreset(presetId)
+    setSettings((current) => ({
+      ...current,
+      ...preset.settings,
     }))
   }
 
@@ -291,8 +371,8 @@ function App() {
           <p className="eyebrow">Music Copilot / Vocal melody</p>
           <h1>Humming to notes</h1>
           <p className="hero-copy">
-            Best with a clear hum, la, or du on one melody line in a quiet
-            room.
+            Best with a clear hum, la, or du on one melody line. Built-in
+            cleanup reduces short background-noise pitch blips.
           </p>
         </div>
         <div className="status-pill">
@@ -376,7 +456,7 @@ function App() {
         <span>Vocal melody mode</span>
         <span>Hum, la, or du clearly</span>
         <span>Use one melody line</span>
-        <span>Keep background noise low</span>
+        <span>Noise cleanup enabled</span>
       </section>
 
       {error ? <p className="error-banner">{error}</p> : null}
@@ -410,6 +490,14 @@ function App() {
               Merged {cleanedMelody.mergedCount} syllable fragment
               {cleanedMelody.mergedCount === 1 ? '' : 's'} into smoother melody
               notes.
+            </div>
+          ) : null}
+
+          {denoisedMelody.removedCount > 0 ? (
+            <div className="cleanup-indicator" role="status">
+              <strong>Noise cleanup applied.</strong>
+              Removed {denoisedMelody.removedCount} unstable pitch blip
+              {denoisedMelody.removedCount === 1 ? '' : 's'} before correction.
             </div>
           ) : null}
 
@@ -478,7 +566,12 @@ function App() {
 
           <div className="suggestion">
             Suggested: {suggestedKey.key} {titleCase(suggestedKey.scale)}
-            <span>{Math.round(suggestedKey.confidence * 100)}%</span>
+            <span>
+              {keySuggestionLabel(
+                suggestedKey.confidence,
+                suggestedKey.fit ?? 0,
+              )}
+            </span>
           </div>
 
           <SettingRow label="Transpose">
@@ -493,17 +586,34 @@ function App() {
             />
           </SettingRow>
 
-          <RangeSetting
-            label="Articulation cleanup"
-            value={settings.articulationCleanup}
-            onChange={(value) => updateSetting('articulationCleanup', value)}
-          />
-
-          <RangeSetting
-            label="Pitch correction"
-            value={settings.correctionStrength}
-            onChange={(value) => updateSetting('correctionStrength', value)}
-          />
+          <section className="preset-section" aria-label="Correction preset">
+            <div className="preset-section-heading">
+              <span>Correction preset</span>
+              <strong>
+                {activePreset === 'custom'
+                  ? 'Custom'
+                  : presetLabel(activePreset)}
+              </strong>
+            </div>
+            <div className="preset-list">
+              {CORRECTION_PRESETS.map((preset) => (
+                <button
+                  className={
+                    activePreset === preset.id
+                      ? 'preset-option selected'
+                      : 'preset-option'
+                  }
+                  key={preset.id}
+                  type="button"
+                  onClick={() => applyCorrectionPreset(preset.id)}
+                  aria-pressed={activePreset === preset.id}
+                >
+                  <strong>{preset.label}</strong>
+                  <span>{preset.description}</span>
+                </button>
+              ))}
+            </div>
+          </section>
 
           <SettingRow label="BPM">
             <input
@@ -532,22 +642,49 @@ function App() {
             </select>
           </SettingRow>
 
-          <RangeSetting
-            label="Rhythm quantize"
-            value={settings.quantizeStrength}
-            onChange={(value) => updateSetting('quantizeStrength', value)}
-          />
+          <details className="advanced-settings">
+            <summary>
+              <span>Advanced cleanup</span>
+              <SlidersHorizontal size={16} />
+            </summary>
 
-          <label className="toggle-row">
-            <input
-              type="checkbox"
-              checked={settings.exportPitchBends}
-              onChange={(event) =>
-                updateSetting('exportPitchBends', event.target.checked)
-              }
-            />
-            Export pitch bends
-          </label>
+            <div className="advanced-settings-content">
+              <RangeSetting
+                label="Noise cleanup"
+                value={settings.noiseCleanup}
+                onChange={(value) => updateSetting('noiseCleanup', value)}
+              />
+
+              <RangeSetting
+                label="Articulation cleanup"
+                value={settings.articulationCleanup}
+                onChange={(value) => updateSetting('articulationCleanup', value)}
+              />
+
+              <RangeSetting
+                label="Pitch correction"
+                value={settings.correctionStrength}
+                onChange={(value) => updateSetting('correctionStrength', value)}
+              />
+
+              <RangeSetting
+                label="Rhythm quantize"
+                value={settings.quantizeStrength}
+                onChange={(value) => updateSetting('quantizeStrength', value)}
+              />
+
+              <label className="toggle-row">
+                <input
+                  type="checkbox"
+                  checked={settings.exportPitchBends}
+                  onChange={(event) =>
+                    updateSetting('exportPitchBends', event.target.checked)
+                  }
+                />
+                Export pitch bends
+              </label>
+            </div>
+          </details>
         </aside>
       </section>
 
@@ -758,4 +895,27 @@ function formatSeconds(seconds: number): string {
 
 function titleCase(value: string): string {
   return value.replace(/\b\w/g, (letter) => letter.toUpperCase())
+}
+
+function keySuggestionLabel(confidence: number, fit: number): string {
+  if (fit < 0.55) {
+    return 'Weak fit'
+  }
+
+  if (confidence < 0.08) {
+    return 'Ambiguous key'
+  }
+
+  if (confidence < 0.18) {
+    return 'Possible key'
+  }
+
+  return 'Clear key'
+}
+
+function presetLabel(presetId: CorrectionPresetId): string {
+  return (
+    CORRECTION_PRESETS.find((preset) => preset.id === presetId)?.label ??
+    'Balanced'
+  )
 }

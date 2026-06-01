@@ -15,6 +15,8 @@ const DEFAULT_KEY: KeySuggestion = {
   key: 'C',
   scale: 'major',
   confidence: 0,
+  fit: 0,
+  ambiguous: true,
 }
 const SHARP_NOTE_NAMES = [
   'C',
@@ -67,6 +69,8 @@ export function inferKey(notes: DetectedNote[]): KeySuggestion {
     key: best.key,
     scale: best.scale,
     confidence,
+    fit: best.fit,
+    ambiguous: confidence < 0.08,
   }
 }
 
@@ -191,6 +195,7 @@ export function defaultSettings(suggestion: KeySuggestion): AnalysisSettings {
     key: suggestion.key,
     scale: suggestion.scale,
     transpose: 0,
+    noiseCleanup: 0.7,
     articulationCleanup: 0.7,
     correctionStrength: 0.85,
     tempo: 100,
@@ -204,22 +209,31 @@ function scoreKey(
   notes: DetectedNote[],
   key: KeyName,
   scale: ScaleName,
-): KeySuggestion & { score: number } {
+): KeySuggestion & { fit: number; score: number } {
   const pitchClasses = scalePitchClasses(key, scale)
+  let fitWeight = 0
+  let totalWeight = 0
   const score = notes.reduce((sum, note, index) => {
     const pitchClass = positiveModulo(Math.round(note.midi), 12)
     const weight =
       Math.max(0.05, note.duration) *
       clamp(note.velocity, 0.1, 1) *
       (index === 0 || index === notes.length - 1 ? 1.4 : 1)
+    const isInScale = pitchClasses.includes(pitchClass)
 
-    return sum + (pitchClasses.includes(pitchClass) ? weight : -weight * 0.25)
+    totalWeight += weight
+    if (isInScale) {
+      fitWeight += weight
+    }
+
+    return sum + (isInScale ? weight : -weight * 0.25)
   }, 0)
 
   return {
     key,
     scale,
     confidence: 0,
+    fit: totalWeight > 0 ? fitWeight / totalWeight : 0,
     score,
   }
 }

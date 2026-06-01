@@ -34,6 +34,33 @@ describe('articulation cleanup', () => {
     expect(result.notes.map((candidate) => candidate.id)).toEqual(['a', 'b'])
   })
 
+  it('merges adjacent short fragments less than one semitone apart', () => {
+    const result = cleanupArticulation(
+      [
+        note('a', 60.15, 0, 0.12),
+        note('b', 60.92, 0.17, 0.12),
+      ],
+      0.7,
+    )
+
+    expect(result.mergedCount).toBe(1)
+    expect(result.notes).toHaveLength(1)
+    expect(result.notes[0]?.midi).toBeCloseTo(60.535)
+  })
+
+  it('keeps adjacent movement of at least one semitone separate', () => {
+    const result = cleanupArticulation(
+      [
+        note('a', 60, 0, 0.12),
+        note('b', 61, 0.17, 0.12),
+      ],
+      1,
+    )
+
+    expect(result.mergedCount).toBe(0)
+    expect(result.notes).toHaveLength(2)
+  })
+
   it('does not merge long repeated notes unnecessarily', () => {
     const result = cleanupArticulation(
       [

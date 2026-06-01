@@ -61,6 +61,7 @@ export interface AnalysisSettings {
   key: KeyName
   scale: ScaleName
   transpose: number
+  noiseCleanup: number
   articulationCleanup: number
   correctionStrength: number
   tempo: number
@@ -73,6 +74,8 @@ export interface KeySuggestion {
   key: KeyName
   scale: ScaleName
   confidence: number
+  fit?: number
+  ambiguous?: boolean
 }
 
 export interface AnalysisResult {

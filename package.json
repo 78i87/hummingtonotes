@@ -8,6 +8,7 @@
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "test": "vitest run",
+    "eval:samplebank": "node scripts/evaluate-fast-pitch.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

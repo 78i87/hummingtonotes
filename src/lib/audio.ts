@@ -51,7 +51,18 @@ export async function resampleToBasicPitchInput(
   audioBuffer: AudioBuffer,
 ): Promise<Float32Array> {
   const offlineBuffer = await renderMonoBuffer(audioBuffer, TARGET_SAMPLE_RATE)
-  return offlineBuffer.getChannelData(0).slice()
+  return applyVocalBandLimit(
+    offlineBuffer.getChannelData(0).slice(),
+    TARGET_SAMPLE_RATE,
+  )
+}
+
+export function applyVocalBandLimit(
+  samples: Float32Array,
+  sampleRate: number,
+): Float32Array {
+  const highPassed = applyBiquad(samples, sampleRate, 'highpass', 85, 0.707)
+  return applyBiquad(highPassed, sampleRate, 'lowpass', 1150, 0.707)
 }
 
 async function renderMonoBuffer(
@@ -88,4 +99,57 @@ async function renderMonoBuffer(
   source.start(0)
 
   return offlineContext.startRendering()
+}
+
+function applyBiquad(
+  samples: Float32Array,
+  sampleRate: number,
+  type: 'highpass' | 'lowpass',
+  frequency: number,
+  q: number,
+): Float32Array {
+  const omega = (2 * Math.PI * frequency) / sampleRate
+  const sin = Math.sin(omega)
+  const cos = Math.cos(omega)
+  const alpha = sin / (2 * q)
+  const a0 = 1 + alpha
+  const a1 = -2 * cos
+  const a2 = 1 - alpha
+  let b0: number
+  let b1: number
+  let b2: number
+
+  if (type === 'highpass') {
+    b0 = (1 + cos) / 2
+    b1 = -(1 + cos)
+    b2 = (1 + cos) / 2
+  } else {
+    b0 = (1 - cos) / 2
+    b1 = 1 - cos
+    b2 = (1 - cos) / 2
+  }
+
+  b0 /= a0
+  b1 /= a0
+  b2 /= a0
+  const normalizedA1 = a1 / a0
+  const normalizedA2 = a2 / a0
+  const output = new Float32Array(samples.length)
+  let x1 = 0
+  let x2 = 0
+  let y1 = 0
+  let y2 = 0
+
+  for (let index = 0; index < samples.length; index += 1) {
+    const x0 = samples[index]
+    const y0 =
+      b0 * x0 + b1 * x1 + b2 * x2 - normalizedA1 * y1 - normalizedA2 * y2
+    output[index] = y0
+    x2 = x1
+    x1 = x0
+    y2 = y1
+    y1 = y0
+  }
+
+  return output
 }

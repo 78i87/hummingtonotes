@@ -435,6 +435,102 @@ h2 {
 .suggestion span {
   color: var(--accent-strong);
   font-weight: 700;
+  white-space: nowrap;
+}
+
+.preset-section {
+  margin: 18px 0;
+}
+
+.preset-section-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+  color: var(--muted);
+  font-size: 0.84rem;
+}
+
+.preset-section-heading strong {
+  color: var(--accent-strong);
+  font-size: 0.78rem;
+}
+
+.preset-list {
+  display: grid;
+  gap: 8px;
+}
+
+.preset-option {
+  width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  padding: 11px 12px;
+  color: var(--muted);
+  background: rgba(255, 254, 250, 0.68);
+  text-align: left;
+  transition:
+    background 160ms ease,
+    border-color 160ms ease,
+    transform 160ms ease;
+}
+
+.preset-option:hover {
+  transform: translateY(-1px);
+  border-color: rgba(15, 118, 110, 0.42);
+}
+
+.preset-option.selected {
+  border-color: rgba(15, 118, 110, 0.54);
+  color: var(--accent-strong);
+  background: rgba(15, 118, 110, 0.08);
+}
+
+.preset-option strong,
+.preset-option span {
+  display: block;
+}
+
+.preset-option strong {
+  color: var(--ink);
+  font-size: 0.9rem;
+}
+
+.preset-option span {
+  margin-top: 3px;
+  font-size: 0.78rem;
+  line-height: 1.35;
+}
+
+.advanced-settings {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px solid rgba(216, 209, 195, 0.8);
+}
+
+.advanced-settings summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 0.9rem;
+  list-style: none;
+}
+
+.advanced-settings summary::-webkit-details-marker {
+  display: none;
+}
+
+.advanced-settings summary span {
+  color: var(--ink);
+  font-weight: 700;
+}
+
+.advanced-settings-content {
+  margin-top: 14px;
 }
 
 .toggle-row {

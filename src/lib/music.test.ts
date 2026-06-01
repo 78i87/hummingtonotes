@@ -71,6 +71,8 @@ describe('music correction', () => {
 
     expect(suggestion.key).toBe('C')
     expect(suggestion.scale).toBe('major')
+    expect(suggestion.fit).toBe(1)
+    expect(suggestion.ambiguous).toBe(true)
   })
 
   it('creates a non-empty detuned sine fixture', () => {

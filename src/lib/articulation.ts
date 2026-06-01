@@ -6,6 +6,8 @@ export interface ArticulationCleanupResult {
   originalCount: number
 }
 
+const PITCH_MERGE_SEMITONES = 1
+
 export function cleanupArticulation(
   notes: DetectedNote[],
   strength: number,
@@ -51,8 +53,8 @@ function shouldMergeSyllableFragment(
   strength: number,
 ): boolean {
   const safeStrength = clamp(strength, 0, 1)
-  const samePitch = Math.round(current.midi) === Math.round(next.midi)
-  if (!samePitch) {
+  const pitchDistance = Math.abs(current.midi - next.midi)
+  if (pitchDistance >= PITCH_MERGE_SEMITONES) {
     return false
   }
 
@@ -89,7 +91,12 @@ function mergeNotes(first: DetectedNote, second: DetectedNote): DetectedNote {
     id: `${first.id}+${second.id}`,
     start,
     duration,
-    midi: weightedAverage(first.midi, second.midi, first.duration, second.duration),
+    midi: weightedAverage(
+      first.midi,
+      second.midi,
+      first.duration,
+      second.duration,
+    ),
     velocity: weightedAverage(
       first.velocity,
       second.velocity,
