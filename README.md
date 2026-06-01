@@ -37,6 +37,12 @@ npm run build
 
 Audio is processed in the browser. The Basic Pitch model files are served from `public/basic-pitch/`; the app does not upload recordings to a backend.
 
+## Third-Party Notices
+
+Transcription is powered by Spotify Basic Pitch and runs locally in the browser. Spotify is not affiliated with or endorsing this app.
+
+License notices for direct runtime dependencies are in [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md).
+
 ## Notes
 
 - Best results come from one clear melody line at a time.
