@@ -9,6 +9,7 @@
     "lint": "eslint .",
     "test": "vitest run",
     "eval:samplebank": "node scripts/evaluate-fast-pitch.mjs",
+    "eval:live": "node scripts/evaluate-live-engine.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

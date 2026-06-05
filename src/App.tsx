@@ -1,379 +1,732 @@
 import {
-  ChevronDown,
-  ChevronUp,
   Download,
-  FileAudio,
   LoaderCircle,
   Mic,
   Play,
   RotateCcw,
+  Save,
   SlidersHorizontal,
   Square,
-  Upload,
-  Wand2,
 } from 'lucide-react'
-import type { ChangeEvent, ReactNode } from 'react'
+import type { ReactNode } from 'react'
 import { useEffect, useMemo, useRef, useState } from 'react'
+import { Note, Scale } from 'tonal'
 
+import { decodeBlobToAudioSource } from './lib/audio'
 import {
-  decodeBlobToAudioSource,
-  decodeFileToAudioSource,
-  type AudioSource,
-} from './lib/audio'
-import { cleanupArticulation } from './lib/articulation'
-import { createMidiBlob } from './lib/midi'
-import { adjustNotes, defaultSettings, inferKey } from './lib/music'
-import { cleanupNoiseArtifacts } from './lib/noise'
+  LIVE_FRAME_SIZE,
+  analyzeLiveFrame,
+  classifyTrigger,
+  cleanupCapturedClip,
+  createLiveEngineState,
+  extractTriggerFeature,
+  mergeClipWithBasicPitch,
+  type LiveEngineState,
+} from './lib/liveEngine'
+import { createPerformanceMidiBlob } from './lib/midi'
+import { midiToNoteName } from './lib/music'
 import { playPianoNotes, type PlaybackHandle } from './lib/playback'
+import { createDefaultProfile, loadProfile, saveProfile } from './lib/profile'
 import { KEYS, SCALES } from './lib/types'
 import type {
-  AdjustedNote,
-  AnalysisSettings,
-  ManualNoteEdit,
-  RawTranscription,
+  CapturedClip,
+  CcMapping,
+  CcSource,
+  KeyName,
+  LivePitchFrame,
+  PerformanceEvent,
+  PitchBendEvent,
+  PitchBendMode,
+  ScaleName,
+  TriggerEvent,
+  TriggerSlot,
+  VocalProfile,
 } from './lib/types'
 
-const GRID_OPTIONS = [
-  { value: 1, label: '1/4' },
-  { value: 0.5, label: '1/8' },
-  { value: 0.25, label: '1/16' },
-  { value: 0.125, label: '1/32' },
+type ControllerStatus =
+  | 'idle'
+  | 'monitoring'
+  | 'capturing'
+  | 'processing'
+  | 'calibrating'
+
+interface ActiveVoice {
+  oscillators: OscillatorNode[]
+  gain: GainNode
+}
+
+const CC_SOURCES: Array<{ value: CcSource; label: string }> = [
+  { value: 'envelope', label: 'Envelope' },
+  { value: 'ah', label: 'Ah' },
+  { value: 'ee', label: 'Ee' },
+  { value: 'oo', label: 'Oo' },
 ]
-
-const CORRECTION_PRESETS = [
-  {
-    id: 'light',
-    label: 'Light',
-    description: 'Keeps repeated notes and expressive timing.',
-    settings: {
-      noiseCleanup: 0.35,
-      articulationCleanup: 0.3,
-      correctionStrength: 0.55,
-      quantizeStrength: 0.35,
-    },
-  },
-  {
-    id: 'balanced',
-    label: 'Balanced',
-    description: 'Best default for hum, la, or du melodies.',
-    settings: {
-      noiseCleanup: 0.7,
-      articulationCleanup: 0.7,
-      correctionStrength: 0.85,
-      quantizeStrength: 0.75,
-    },
-  },
-  {
-    id: 'noisy',
-    label: 'Noisy room',
-    description: 'Stronger cleanup for short high or low blips.',
-    settings: {
-      noiseCleanup: 0.9,
-      articulationCleanup: 0.78,
-      correctionStrength: 0.85,
-      quantizeStrength: 0.75,
-    },
-  },
-] as const
-
-const DEFAULT_PRESET_ID = 'balanced'
-const PRESET_SETTING_KEYS: Array<keyof AnalysisSettings> = [
-  'noiseCleanup',
-  'articulationCleanup',
-  'correctionStrength',
-  'quantizeStrength',
-]
-
-type AppStatus = 'idle' | 'ready' | 'recording' | 'analyzing' | 'complete'
-type CorrectionPresetId = (typeof CORRECTION_PRESETS)[number]['id']
-type ActivePreset = CorrectionPresetId | 'custom'
-
-const initialSettings = defaultSettings({
-  key: 'C',
-  scale: 'major',
-  confidence: 0,
-})
 
 function App() {
-  const [source, setSource] = useState<AudioSource | null>(null)
-  const [rawTranscription, setRawTranscription] =
-    useState<RawTranscription | null>(null)
-  const [settings, setSettings] = useState<AnalysisSettings>(initialSettings)
-  const [manualEdits, setManualEdits] = useState<
-    Record<string, ManualNoteEdit>
-  >({})
-  const [status, setStatus] = useState<AppStatus>('idle')
+  const [profile, setProfile] = useState<VocalProfile>(() => loadProfile())
+  const [status, setStatus] = useState<ControllerStatus>('idle')
+  const [latestFrame, setLatestFrame] = useState<LivePitchFrame | null>(null)
+  const [recentFrames, setRecentFrames] = useState<LivePitchFrame[]>([])
+  const [clip, setClip] = useState<CapturedClip | null>(null)
   const [progress, setProgress] = useState(0)
+  const [tempo, setTempo] = useState(120)
   const [error, setError] = useState('')
-  const [isPlayingMidi, setIsPlayingMidi] = useState(false)
-  const [activePreset, setActivePreset] =
-    useState<ActivePreset>(DEFAULT_PRESET_ID)
+  const [isPlayingClip, setIsPlayingClip] = useState(false)
+
+  const profileRef = useRef(profile)
+  const audioContextRef = useRef<AudioContext | null>(null)
+  const streamRef = useRef<MediaStream | null>(null)
+  const sourceNodeRef = useRef<MediaStreamAudioSourceNode | null>(null)
+  const inputGainRef = useRef<GainNode | null>(null)
+  const recordingDestinationRef = useRef<MediaStreamAudioDestinationNode | null>(null)
+  const processorRef = useRef<ScriptProcessorNode | null>(null)
+  const silentGainRef = useRef<GainNode | null>(null)
+  const filterRef = useRef<BiquadFilterNode | null>(null)
+  const masterRef = useRef<GainNode | null>(null)
+  const engineStateRef = useRef<LiveEngineState>(createLiveEngineState())
+  const sessionStartedAtRef = useRef(0)
+  const captureStartedAtRef = useRef(0)
+  const isCapturingRef = useRef(false)
+  const capturedFramesRef = useRef<LivePitchFrame[]>([])
+  const capturedEventsRef = useRef<PerformanceEvent[]>([])
+  const lastSamplesRef = useRef<Float32Array | null>(null)
+  const lastTriggerAtRef = useRef(-1)
+  const liveFrameCounterRef = useRef(0)
+  const activeVoicesRef = useRef<Map<number, ActiveVoice>>(new Map())
   const mediaRecorderRef = useRef<MediaRecorder | null>(null)
-  const chunksRef = useRef<Blob[]>([])
+  const recorderChunksRef = useRef<Blob[]>([])
+  const pendingLiveClipRef = useRef<CapturedClip | null>(null)
+  const stopMicAfterProcessingRef = useRef(false)
+  const isStartingMicRef = useRef(false)
   const playbackRef = useRef<PlaybackHandle | null>(null)
 
-  const suggestedKey = useMemo(
-    () =>
-      inferKey(
-        rawTranscription
-          ? cleanupArticulation(
-              cleanupNoiseArtifacts(
-                rawTranscription.notes,
-                settings.noiseCleanup,
-              ).notes,
-              settings.articulationCleanup,
-            ).notes
-          : [],
-      ),
-    [rawTranscription, settings.articulationCleanup, settings.noiseCleanup],
-  )
-  const denoisedMelody = useMemo(
-    () =>
-      rawTranscription
-        ? cleanupNoiseArtifacts(rawTranscription.notes, settings.noiseCleanup)
-        : { notes: [], removedCount: 0, originalCount: 0 },
-    [rawTranscription, settings.noiseCleanup],
-  )
-  const cleanedMelody = useMemo(
-    () =>
-      cleanupArticulation(denoisedMelody.notes, settings.articulationCleanup),
-    [denoisedMelody.notes, settings.articulationCleanup],
-  )
-  const adjustedNotes = useMemo(
-    () =>
-      rawTranscription
-        ? adjustNotes(cleanedMelody.notes, settings, manualEdits)
-        : [],
-    [cleanedMelody.notes, manualEdits, rawTranscription, settings],
-  )
+  const latestNote = latestFrame?.lockedMidi
+    ? midiToNoteName(latestFrame.lockedMidi)
+    : '...'
+  const latestCents = latestFrame ? Math.round(latestFrame.centsOffset) : 0
+  const profileCompleteness = useMemo(() => {
+    const trained = profile.triggers.filter((slot) => slot.examples.length >= 5).length
+    return Math.round((trained / profile.triggers.length) * 100)
+  }, [profile.triggers])
 
   useEffect(() => {
-    return () => {
-      playbackRef.current?.stop()
-    }
-  }, [])
+    profileRef.current = profile
+    saveProfile(profile)
+  }, [profile])
 
-  async function handleUpload(event: ChangeEvent<HTMLInputElement>) {
-    const file = event.target.files?.[0]
-    if (!file) {
+  useEffect(() => {
+    const context = audioContextRef.current
+    const inputGain = inputGainRef.current
+    if (!context || !inputGain) {
       return
     }
 
-    await loadSource(() => decodeFileToAudioSource(file))
-    event.target.value = ''
+    inputGain.gain.setTargetAtTime(profile.pitch.inputLevel, context.currentTime, 0.015)
+  }, [profile.pitch.inputLevel])
+
+  useEffect(() => {
+    const activeVoices = activeVoicesRef.current
+
+    return () => {
+      playbackRef.current?.stop()
+      activeVoices.forEach((voice) => {
+        voice.oscillators.forEach((oscillator) => {
+          try {
+            oscillator.stop()
+          } catch {
+            // Audio nodes may already be stopped during normal shutdown.
+          }
+        })
+        voice.gain.disconnect()
+      })
+      processorRef.current?.disconnect()
+      sourceNodeRef.current?.disconnect()
+      inputGainRef.current?.disconnect()
+      recordingDestinationRef.current?.disconnect()
+      silentGainRef.current?.disconnect()
+      masterRef.current?.disconnect()
+      streamRef.current?.getTracks().forEach((track) => track.stop())
+      void audioContextRef.current?.close()
+    }
+  }, [])
+
+  async function startSession() {
+    if (isStartingMicRef.current || status !== 'idle') {
+      return
+    }
+
+    isStartingMicRef.current = true
+    try {
+      await startMic(true)
+    } finally {
+      isStartingMicRef.current = false
+    }
   }
 
-  async function startRecording() {
+  function stopSession() {
+    if (status === 'capturing') {
+      stopCapture(true)
+      return
+    }
+
+    stopMic()
+  }
+
+  async function startMic(startCapturing: boolean) {
     try {
       setError('')
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
+          autoGainControl: false,
+          echoCancellation: false,
+          noiseSuppression: false,
         },
       })
-      const mimeType = preferredMimeType()
-      const recorder = new MediaRecorder(
-        stream,
-        mimeType ? { mimeType } : undefined,
-      )
-      chunksRef.current = []
-      mediaRecorderRef.current = recorder
+      const context = new AudioContext()
+      await context.resume()
 
-      recorder.ondataavailable = (event) => {
-        if (event.data.size > 0) {
-          chunksRef.current.push(event.data)
+      const sourceNode = context.createMediaStreamSource(stream)
+      const inputGain = context.createGain()
+      inputGain.gain.value = profileRef.current.pitch.inputLevel
+      const recordingDestination = context.createMediaStreamDestination()
+      const processor = context.createScriptProcessor(LIVE_FRAME_SIZE, 1, 1)
+      const silentGain = context.createGain()
+      silentGain.gain.value = 0
+      const master = context.createGain()
+      master.gain.value = 0.34
+      const filter = context.createBiquadFilter()
+      filter.type = 'lowpass'
+      filter.frequency.value = 1800
+      filter.Q.value = 0.8
+      master.connect(filter)
+      filter.connect(context.destination)
+
+      sessionStartedAtRef.current = context.currentTime
+      engineStateRef.current = createLiveEngineState()
+      sourceNode.connect(inputGain)
+      inputGain.connect(processor)
+      inputGain.connect(recordingDestination)
+      processor.connect(silentGain)
+      silentGain.connect(context.destination)
+      processor.onaudioprocess = handleAudioProcess
+
+      audioContextRef.current = context
+      streamRef.current = stream
+      sourceNodeRef.current = sourceNode
+      inputGainRef.current = inputGain
+      recordingDestinationRef.current = recordingDestination
+      processorRef.current = processor
+      silentGainRef.current = silentGain
+      masterRef.current = master
+      filterRef.current = filter
+
+      if ('MediaRecorder' in window) {
+        const mimeType = preferredMimeType()
+        mediaRecorderRef.current = new MediaRecorder(
+          recordingDestination.stream,
+          mimeType ? { mimeType } : undefined,
+        )
+        mediaRecorderRef.current.ondataavailable = (event) => {
+          if (event.data.size > 0) {
+            recorderChunksRef.current.push(event.data)
+          }
+        }
+        mediaRecorderRef.current.onstop = () => {
+          void finishBasicPitchMerge(mimeType || 'audio/webm')
         }
       }
 
-      recorder.onstop = () => {
-        stream.getTracks().forEach((track) => track.stop())
-        const blob = new Blob(chunksRef.current, {
-          type: mimeType || 'audio/webm',
-        })
-        void loadSource(() => decodeBlobToAudioSource(blob, 'Mic recording'))
+      if (startCapturing) {
+        beginCapture(context)
+      } else {
+        setStatus('monitoring')
       }
-
-      recorder.start()
-      setStatus('recording')
-    } catch (recordingError) {
-      setStatus(source ? 'ready' : 'idle')
-      setError(errorMessage(recordingError))
+    } catch (startError) {
+      setError(errorMessage(startError))
+      setStatus('idle')
     }
   }
 
-  function stopRecording() {
-    mediaRecorderRef.current?.stop()
-    mediaRecorderRef.current = null
+  function stopMic() {
+    if (isCapturingRef.current) {
+      stopCapture(true)
+      return
+    }
+
+    releaseMicHardware()
+    setStatus('idle')
   }
 
-  async function analyzeSource() {
-    if (!source) {
+  function beginCapture(context: AudioContext) {
+    if (isCapturingRef.current) {
+      return
+    }
+
+    stopClipPlayback()
+    setError('')
+    setProgress(0)
+    setClip(null)
+    capturedFramesRef.current = []
+    capturedEventsRef.current = []
+    recorderChunksRef.current = []
+    pendingLiveClipRef.current = null
+    captureStartedAtRef.current = context.currentTime - sessionStartedAtRef.current
+    isCapturingRef.current = true
+
+    if (mediaRecorderRef.current?.state === 'inactive') {
+      mediaRecorderRef.current.start()
+    }
+
+    setStatus('capturing')
+  }
+
+  function stopCapture(stopMicAfterProcessing = false) {
+    if (!isCapturingRef.current) {
+      return
+    }
+
+    stopMicAfterProcessingRef.current = stopMicAfterProcessing
+    const context = audioContextRef.current
+    const now =
+      context && sessionStartedAtRef.current
+        ? context.currentTime - sessionStartedAtRef.current
+        : latestFrame?.time ?? 0
+    const duration = Math.max(0.05, now - captureStartedAtRef.current)
+    const activeMidi = engineStateRef.current.activeMidi
+    if (activeMidi !== null) {
+      capturedEventsRef.current.push({
+        id: `capture-stop-${now}`,
+        type: 'noteOff',
+        time: duration,
+        midi: activeMidi,
+      })
+      engineStateRef.current.activeMidi = null
+    }
+
+    isCapturingRef.current = false
+    setStatus('processing')
+    const liveClip = cleanupCapturedClip({
+      frames: capturedFramesRef.current,
+      events: capturedEventsRef.current,
+      duration,
+      profile: profileRef.current,
+    })
+    pendingLiveClipRef.current = liveClip
+    setClip(liveClip)
+
+    if (mediaRecorderRef.current?.state === 'recording') {
+      mediaRecorderRef.current.stop()
+    } else {
+      if (stopMicAfterProcessing) {
+        releaseMicHardware()
+        setStatus('idle')
+      } else {
+        setStatus(audioContextRef.current ? 'monitoring' : 'idle')
+      }
+    }
+  }
+
+  async function finishBasicPitchMerge(mimeType: string) {
+    const liveClip = pendingLiveClipRef.current
+    if (!liveClip) {
+      setStatus(audioContextRef.current ? 'monitoring' : 'idle')
       return
     }
 
     try {
-      stopMidiPlayback()
-      setError('')
-      setStatus('analyzing')
-      setProgress(0)
+      const blob = new Blob(recorderChunksRef.current, { type: mimeType })
+      if (blob.size === 0) {
+        setStatus(audioContextRef.current ? 'monitoring' : 'idle')
+        return
+      }
+
+      const source = await decodeBlobToAudioSource(blob, 'Vocal capture')
       const { transcribeWithBasicPitch } = await import('./lib/transcription')
       const raw = await transcribeWithBasicPitch(source.buffer, setProgress)
-      const denoised = cleanupNoiseArtifacts(
-        raw.notes,
-        settings.noiseCleanup,
-      )
-      const cleaned = cleanupArticulation(
-        denoised.notes,
-        settings.articulationCleanup,
-      )
-      const suggestion = inferKey(cleaned.notes)
-      setRawTranscription(raw)
-      setManualEdits({})
-      setSettings((current) => ({
+      const merged = mergeClipWithBasicPitch(liveClip, raw.notes, profileRef.current)
+      setClip(merged)
+      updateProfile((current) => ({
         ...current,
-        key: suggestion.key,
-        scale: suggestion.scale,
+        pitch: {
+          ...current.pitch,
+          key: merged.suggestedKey.key,
+          scale: merged.suggestedKey.scale,
+        },
       }))
-      setStatus('complete')
-    } catch (analysisError) {
-      setStatus('ready')
-      setError(errorMessage(analysisError))
+    } catch (mergeError) {
+      setError(`Live capture saved; Basic Pitch cleanup failed: ${errorMessage(mergeError)}`)
+    } finally {
+      const shouldStopMic = stopMicAfterProcessingRef.current
+      stopMicAfterProcessingRef.current = false
+      if (shouldStopMic) {
+        releaseMicHardware()
+      }
+      setStatus(shouldStopMic ? 'idle' : audioContextRef.current ? 'monitoring' : 'idle')
+      setProgress(0)
+      recorderChunksRef.current = []
+      pendingLiveClipRef.current = null
     }
   }
 
-  function exportMidi() {
-    if (adjustedNotes.length === 0) {
+  function handleAudioProcess(event: AudioProcessingEvent) {
+    const context = audioContextRef.current
+    if (!context) {
       return
     }
 
-    const blob = createMidiBlob(adjustedNotes, settings)
+    const input = event.inputBuffer.getChannelData(0)
+    const samples = new Float32Array(input)
+    lastSamplesRef.current = samples
+    const time = context.currentTime - sessionStartedAtRef.current
+    const result = analyzeLiveFrame(
+      samples,
+      context.sampleRate,
+      time,
+      profileRef.current,
+      engineStateRef.current,
+    )
+    const events = [...result.events]
+
+    const triggerEvent = triggerEventForFrame(samples, result.frame)
+    if (triggerEvent) {
+      events.push(triggerEvent)
+    }
+
+    playLiveEvents(events)
+    recordLiveData(result.frame, events)
+
+    liveFrameCounterRef.current += 1
+    if (liveFrameCounterRef.current % 3 === 0) {
+      setLatestFrame(result.frame)
+      setRecentFrames((current) => [...current.slice(-140), result.frame])
+    }
+  }
+
+  function recordLiveData(frame: LivePitchFrame, events: PerformanceEvent[]) {
+    if (!isCapturingRef.current) {
+      return
+    }
+
+    const offset = captureStartedAtRef.current
+    capturedFramesRef.current.push({
+      ...frame,
+      time: Math.max(0, frame.time - offset),
+    })
+    capturedEventsRef.current.push(
+      ...events.map((event) => ({
+        ...event,
+        time: Math.max(0, event.time - offset),
+      })),
+    )
+  }
+
+  function triggerEventForFrame(
+    samples: Float32Array,
+    frame: LivePitchFrame,
+  ): TriggerEvent | null {
+    if (frame.voiced) {
+      return null
+    }
+
+    if (
+      frame.rms < profileRef.current.calibration.rmsThreshold * 1.75 ||
+      frame.time - lastTriggerAtRef.current < 0.12
+    ) {
+      return null
+    }
+
+    const feature = extractTriggerFeature(samples)
+    const slot = classifyTrigger(feature, profileRef.current.triggers)
+    if (!slot) {
+      return null
+    }
+
+    lastTriggerAtRef.current = frame.time
+    return {
+      id: `trigger-${slot.id}-${frame.time}`,
+      type: 'trigger',
+      time: frame.time,
+      midi: slot.midi,
+      velocity: Math.max(0.1, Math.min(1, frame.rms / profileRef.current.calibration.vocalRms)),
+      slotId: slot.id,
+    }
+  }
+
+  function calibrateSilence() {
+    if (recentFrames.length === 0) {
+      return
+    }
+
+    setStatus('calibrating')
+    const floor = average(recentFrames.slice(-40).map((frame) => frame.rms))
+    updateProfile((current) => ({
+      ...current,
+      calibration: {
+        ...current.calibration,
+        noiseFloorRms: floor,
+        rmsThreshold: Math.max(floor * 3.2, 0.01),
+      },
+    }))
+    window.setTimeout(() => setStatus(audioContextRef.current ? 'monitoring' : 'idle'), 180)
+  }
+
+  function calibrateVoice() {
+    if (recentFrames.length === 0) {
+      return
+    }
+
+    setStatus('calibrating')
+    const voiced = recentFrames
+      .slice(-90)
+      .filter((frame) => frame.estimatedMidi !== null && frame.rms > 0.01)
+    const rmsValues = voiced.map((frame) => frame.rms)
+    const midiValues = voiced
+      .map((frame) => frame.estimatedMidi)
+      .filter((midi): midi is number => midi !== null)
+    if (rmsValues.length > 0 && midiValues.length > 0) {
+      updateProfile((current) => ({
+        ...current,
+        calibration: {
+          ...current.calibration,
+          vocalRms: Math.max(average(rmsValues), current.calibration.noiseFloorRms * 6),
+          rmsThreshold: Math.max(current.calibration.noiseFloorRms * 3.2, average(rmsValues) * 0.2),
+          minMidi: Math.floor(Math.min(...midiValues) - 12),
+          maxMidi: Math.ceil(Math.max(...midiValues) + 12),
+        },
+      }))
+    }
+    window.setTimeout(() => setStatus(audioContextRef.current ? 'monitoring' : 'idle'), 180)
+  }
+
+  function trainTrigger(slotId: string) {
+    const samples = lastSamplesRef.current
+    if (!samples) {
+      return
+    }
+
+    const feature = extractTriggerFeature(samples)
+    updateProfile((current) => ({
+      ...current,
+      triggers: current.triggers.map((slot) =>
+        slot.id === slotId
+          ? {
+              ...slot,
+              examples: [...slot.examples, feature].slice(-5),
+            }
+          : slot,
+      ),
+    }))
+  }
+
+  function resetTrigger(slotId: string) {
+    updateProfile((current) => ({
+      ...current,
+      triggers: current.triggers.map((slot) =>
+        slot.id === slotId ? { ...slot, examples: [] } : slot,
+      ),
+    }))
+  }
+
+  function exportMidi() {
+    if (!clip) {
+      return
+    }
+
+    const blob = createPerformanceMidiBlob(clip, tempo)
     const url = URL.createObjectURL(blob)
     const link = document.createElement('a')
     link.href = url
-    link.download = 'hummed-melody.mid'
+    link.download = 'vocal-controller-capture.mid'
     link.click()
     URL.revokeObjectURL(url)
   }
 
-  async function toggleMidiPlayback() {
-    if (isPlayingMidi) {
-      stopMidiPlayback()
+  async function toggleClipPlayback() {
+    if (isPlayingClip) {
+      stopClipPlayback()
       return
     }
 
-    if (adjustedNotes.length === 0) {
+    if (!clip || clip.cleanedNotes.length === 0) {
       return
     }
 
     try {
-      setError('')
-      setIsPlayingMidi(true)
-      playbackRef.current = await playPianoNotes(adjustedNotes, () => {
+      setIsPlayingClip(true)
+      playbackRef.current = await playPianoNotes(clip.cleanedNotes, () => {
         playbackRef.current = null
-        setIsPlayingMidi(false)
+        setIsPlayingClip(false)
       })
-    } catch (playbackError) {
-      setIsPlayingMidi(false)
-      setError(errorMessage(playbackError))
+    } catch (playError) {
+      setError(errorMessage(playError))
+      setIsPlayingClip(false)
     }
   }
 
-  function stopMidiPlayback() {
+  function stopClipPlayback() {
     playbackRef.current?.stop()
     playbackRef.current = null
-    setIsPlayingMidi(false)
+    setIsPlayingClip(false)
   }
 
-  function updateSetting<K extends keyof AnalysisSettings>(
-    key: K,
-    value: AnalysisSettings[K],
-  ) {
-    if (key === 'articulationCleanup' || key === 'noiseCleanup') {
-      stopMidiPlayback()
-      setManualEdits({})
-    }
-
-    if (PRESET_SETTING_KEYS.includes(key)) {
-      setActivePreset('custom')
-    }
-
-    setSettings((current) => ({
-      ...current,
-      [key]: value,
-    }))
+  function resetProfile() {
+    stopAllVoices()
+    setProfile(createDefaultProfile())
   }
 
-  function applyCorrectionPreset(presetId: CorrectionPresetId) {
-    const preset = CORRECTION_PRESETS.find(
-      (candidate) => candidate.id === presetId,
-    )
-    if (!preset) {
+  function updateProfile(updater: (profile: VocalProfile) => VocalProfile) {
+    setProfile((current) => updater(current))
+  }
+
+  function playLiveEvents(events: PerformanceEvent[]) {
+    if (!audioContextRef.current || !masterRef.current) {
       return
     }
 
-    stopMidiPlayback()
-    setManualEdits({})
-    setActivePreset(presetId)
-    setSettings((current) => ({
-      ...current,
-      ...preset.settings,
-    }))
-  }
-
-  function nudgeNote(noteId: string, semitones: number) {
-    const note = adjustedNotes.find((candidate) => candidate.id === noteId)
-    if (!note) {
-      return
-    }
-
-    stopMidiPlayback()
-    setManualEdits((current) => ({
-      ...current,
-      [noteId]: {
-        ...current[noteId],
-        midi: note.midi + semitones,
-      },
-    }))
-  }
-
-  function resetNote(noteId: string) {
-    stopMidiPlayback()
-    setManualEdits((current) => {
-      const next = { ...current }
-      delete next[noteId]
-      return next
+    events.forEach((event) => {
+      if (event.type === 'noteOn') {
+        playNote(event.midi, event.velocity)
+      } else if (event.type === 'noteOff') {
+        stopNote(event.midi)
+      } else if (event.type === 'pitchBend') {
+        bendNote(event)
+      } else if (event.type === 'trigger') {
+        playTrigger(event)
+      } else if (event.type === 'cc') {
+        applyCc(event.cc, event.value)
+      }
     })
   }
 
-  async function loadSource(loader: () => Promise<AudioSource>) {
-    try {
-      setError('')
-      const nextSource = await loader()
-      if (source?.url) {
-        URL.revokeObjectURL(source.url)
+  function playNote(midi: number, velocity: number) {
+    const context = audioContextRef.current
+    const master = masterRef.current
+    if (!context || !master || activeVoicesRef.current.has(midi)) {
+      return
+    }
+
+    ;[...activeVoicesRef.current.keys()].forEach((activeMidi) => {
+      if (activeMidi !== midi) {
+        stopNote(activeMidi)
       }
-      setSource(nextSource)
-      setRawTranscription(null)
-      setManualEdits({})
-      stopMidiPlayback()
-      setProgress(0)
-      setStatus('ready')
-    } catch (loadError) {
-      setError(errorMessage(loadError))
+    })
+
+    const gain = context.createGain()
+    gain.gain.setValueAtTime(0.0001, context.currentTime)
+    gain.gain.exponentialRampToValueAtTime(
+      Math.max(0.02, velocity * 0.18),
+      context.currentTime + 0.012,
+    )
+    gain.connect(master)
+
+    const oscillators = ['sawtooth', 'triangle'].map((type, index) => {
+      const oscillator = context.createOscillator()
+      oscillator.type = type as OscillatorType
+      oscillator.frequency.value = midiToFrequency(midi) * (index === 0 ? 1 : 2)
+      oscillator.connect(gain)
+      oscillator.start()
+      return oscillator
+    })
+
+    activeVoicesRef.current.set(midi, { oscillators, gain })
+  }
+
+  function stopNote(midi: number) {
+    const context = audioContextRef.current
+    const voice = activeVoicesRef.current.get(midi)
+    if (!context || !voice) {
+      return
+    }
+
+    voice.gain.gain.cancelScheduledValues(context.currentTime)
+    voice.gain.gain.setTargetAtTime(0.0001, context.currentTime, 0.04)
+    voice.oscillators.forEach((oscillator) => {
+      oscillator.stop(context.currentTime + 0.18)
+    })
+    window.setTimeout(() => voice.gain.disconnect(), 220)
+    activeVoicesRef.current.delete(midi)
+  }
+
+  function bendNote(event: PitchBendEvent) {
+    const context = audioContextRef.current
+    const voice = activeVoicesRef.current.get(event.midi)
+    if (!context || !voice) {
+      return
+    }
+
+    voice.oscillators.forEach((oscillator) => {
+      oscillator.detune.setTargetAtTime(event.value * 200, context.currentTime, 0.018)
+    })
+  }
+
+  function playTrigger(event: TriggerEvent) {
+    const context = audioContextRef.current
+    const master = masterRef.current
+    if (!context || !master) {
+      return
+    }
+
+    const oscillator = context.createOscillator()
+    const gain = context.createGain()
+    oscillator.type = 'square'
+    oscillator.frequency.value = event.midi <= 38 ? 84 : event.midi <= 40 ? 180 : 640
+    gain.gain.setValueAtTime(Math.max(0.02, event.velocity * 0.28), context.currentTime)
+    gain.gain.exponentialRampToValueAtTime(0.0001, context.currentTime + 0.08)
+    oscillator.connect(gain)
+    gain.connect(master)
+    oscillator.start()
+    oscillator.stop(context.currentTime + 0.09)
+    window.setTimeout(() => gain.disconnect(), 120)
+  }
+
+  function applyCc(cc: number, value: number) {
+    const filter = filterRef.current
+    const context = audioContextRef.current
+    if (!filter || !context) {
+      return
+    }
+
+    const normalized = value / 127
+    if (cc === 74 || cc === 71 || cc === 1 || cc === 11) {
+      filter.frequency.setTargetAtTime(600 + normalized * 5200, context.currentTime, 0.035)
+      filter.Q.setTargetAtTime(0.6 + normalized * 5, context.currentTime, 0.05)
     }
   }
 
+  function stopAllVoices() {
+    ;[...activeVoicesRef.current.keys()].forEach((midi) => stopNote(midi))
+  }
+
+  function releaseMicHardware() {
+    stopAllVoices()
+    processorRef.current?.disconnect()
+    sourceNodeRef.current?.disconnect()
+    inputGainRef.current?.disconnect()
+    recordingDestinationRef.current?.disconnect()
+    silentGainRef.current?.disconnect()
+    masterRef.current?.disconnect()
+    streamRef.current?.getTracks().forEach((track) => track.stop())
+    void audioContextRef.current?.close()
+
+    audioContextRef.current = null
+    streamRef.current = null
+    sourceNodeRef.current = null
+    inputGainRef.current = null
+    recordingDestinationRef.current = null
+    processorRef.current = null
+    silentGainRef.current = null
+    masterRef.current = null
+    filterRef.current = null
+    mediaRecorderRef.current = null
+    isCapturingRef.current = false
+  }
+
   return (
-    <main className="app-shell">
-      <header className="topbar">
+    <main className="controller-shell">
+      <header className="controller-topbar">
         <div>
-          <p className="eyebrow">Music Copilot / Vocal melody</p>
-          <h1>Humming to notes</h1>
-          <p className="hero-copy">
-            Best with a clear hum, la, or du on one melody line. Built-in
-            cleanup reduces short background-noise pitch blips.
-          </p>
+          <p className="eyebrow">Music Copilot / Vocal MIDI controller</p>
+          <h1>Voice Controller</h1>
         </div>
         <div className="status-pill">
           <span className={`status-dot status-${status}`} />
@@ -381,161 +734,136 @@ function App() {
         </div>
       </header>
 
-      <section className="transport" aria-label="Transport controls">
+      <section className="transport controller-transport" aria-label="Transport">
         <button
           className="primary-action"
           type="button"
-          onClick={status === 'recording' ? stopRecording : startRecording}
-          disabled={status === 'analyzing'}
-          title={status === 'recording' ? 'Stop recording' : 'Record humming'}
+          onClick={status === 'idle' ? startSession : stopSession}
+          disabled={status === 'processing' || status === 'calibrating'}
+          title={status === 'idle' ? 'Start capture' : 'Stop capture'}
         >
-          {status === 'recording' ? <Square size={18} /> : <Mic size={18} />}
-          {status === 'recording' ? 'Stop' : 'Record'}
+          {status === 'idle' ? <Mic size={18} /> : <Square size={18} />}
+          {status === 'idle' ? 'Start capture' : 'Stop capture'}
         </button>
-
-        <label className="icon-button file-button" title="Upload audio file">
-          <Upload size={18} />
-          <span>Upload</span>
-          <input
-            type="file"
-            accept="audio/*"
-            onChange={handleUpload}
-            disabled={status === 'recording' || status === 'analyzing'}
-          />
-        </label>
-
         <button
           className="icon-button"
           type="button"
-          onClick={analyzeSource}
-          disabled={!source || status === 'recording' || status === 'analyzing'}
-          title="Analyze audio"
+          onClick={toggleClipPlayback}
+          disabled={!clip || clip.cleanedNotes.length === 0}
+          title={isPlayingClip ? 'Stop clip playback' : 'Play captured clip'}
         >
-          {status === 'analyzing' ? (
-            <LoaderCircle className="spin" size={18} />
-          ) : (
-            <Wand2 size={18} />
-          )}
-          Analyze
+          {isPlayingClip ? <Square size={18} /> : <Play size={18} />}
+          {isPlayingClip ? 'Stop clip' : 'Play clip'}
         </button>
-
         <button
           className="icon-button"
           type="button"
           onClick={exportMidi}
-          disabled={adjustedNotes.length === 0}
-          title="Export MIDI"
+          disabled={!clip}
+          title="Export captured MIDI"
         >
           <Download size={18} />
           Export MIDI
         </button>
-
         <button
           className="icon-button"
           type="button"
-          onClick={toggleMidiPlayback}
-          disabled={adjustedNotes.length === 0}
-          title={isPlayingMidi ? 'Stop MIDI playback' : 'Play MIDI as piano'}
+          onClick={() => saveProfile(profile)}
+          title="Save profile"
         >
-          {isPlayingMidi ? <Square size={18} /> : <Play size={18} />}
-          {isPlayingMidi ? 'Stop MIDI' : 'Play MIDI'}
+          <Save size={18} />
+          Save profile
         </button>
-
-        <div className="source-strip">
-          <FileAudio size={18} />
-          <div>
-            <strong>{source?.name ?? 'No audio loaded'}</strong>
-            <span>
-              {source ? formatSeconds(source.duration) : 'Record or upload'}
-            </span>
-          </div>
-        </div>
-      </section>
-
-      <section className="guidance-strip" aria-label="Recording guidance">
-        <span>Vocal melody mode</span>
-        <span>Hum, la, or du clearly</span>
-        <span>Use one melody line</span>
-        <span>Noise cleanup enabled</span>
       </section>
 
       {error ? <p className="error-banner">{error}</p> : null}
-
-      {status === 'analyzing' ? (
-        <div className="progress-track" aria-label="Analysis progress">
+      {status === 'processing' ? (
+        <div className="progress-track" aria-label="Post capture cleanup progress">
           <span style={{ width: `${Math.round(progress * 100)}%` }} />
         </div>
       ) : null}
 
-      <section className="workspace">
-        <section className="timeline-panel" aria-label="Melody timeline">
-          <div className="panel-heading">
-            <div>
-              <p className="eyebrow">Timeline</p>
-              <h2>Raw pitch and corrected melody</h2>
-            </div>
-            <div className="legend">
-              <span>
-                <i className="legend-raw" /> Raw
-              </span>
-              <span>
-                <i className="legend-adjusted" /> Corrected
-              </span>
-            </div>
-          </div>
-
-          {cleanedMelody.mergedCount > 0 ? (
-            <div className="cleanup-indicator" role="status">
-              <strong>Articulation cleanup applied.</strong>
-              Merged {cleanedMelody.mergedCount} syllable fragment
-              {cleanedMelody.mergedCount === 1 ? '' : 's'} into smoother melody
-              notes.
-            </div>
-          ) : null}
-
-          {denoisedMelody.removedCount > 0 ? (
-            <div className="cleanup-indicator" role="status">
-              <strong>Noise cleanup applied.</strong>
-              Removed {denoisedMelody.removedCount} unstable pitch blip
-              {denoisedMelody.removedCount === 1 ? '' : 's'} before correction.
-            </div>
-          ) : null}
-
-          <Timeline
-            rawNotes={rawTranscription?.notes ?? []}
-            adjustedNotes={adjustedNotes}
-            duration={source?.duration ?? rawTranscription?.duration ?? 8}
+      <section className="controller-grid">
+        <section className="pitch-stage" aria-label="Pitch wheel">
+          <KeyConfidenceWheel
+            note={latestNote}
+            cents={latestCents}
+            confidence={latestFrame?.confidence ?? 0}
+            rms={latestFrame?.rms ?? 0}
+            threshold={profile.calibration.rmsThreshold}
+            voiced={latestFrame?.voiced ?? false}
+            keyName={profile.pitch.key}
+            scaleName={profile.pitch.scale}
+            lockedMidi={latestFrame?.lockedMidi ?? null}
           />
-
-          {source?.url ? (
-            <audio className="audio-player" controls src={source.url}>
-              <track kind="captions" />
-            </audio>
-          ) : (
-            <div className="empty-state">
-              <Play size={24} />
-              <span>Load audio to inspect and correct the melody.</span>
-            </div>
-          )}
+          <div className="mode-readout">
+            <span>{profile.pitch.bendMode === 'intellibend' ? 'IntelliBend' : 'TruBend'}</span>
+            <span>{profile.pitch.keyLock ? `${profile.pitch.key} ${profile.pitch.scale}` : 'Chromatic'}</span>
+            <span>Mono note output</span>
+          </div>
+          <LiveTimeline frames={recentFrames} clip={clip} />
         </section>
 
-        <aside className="inspector" aria-label="Analysis settings">
-          <div className="panel-heading compact-heading">
-            <div>
-              <p className="eyebrow">Correction</p>
-              <h2>Musical intent</h2>
-            </div>
-            <SlidersHorizontal size={20} />
+        <aside className="profile-panel" aria-label="Profile and calibration">
+          <PanelHeading eyebrow="Profile" title={profile.name}>
+            <SlidersHorizontal size={18} />
+          </PanelHeading>
+          <SettingRow label="Profile name">
+            <input
+              value={profile.name}
+              onChange={(event) =>
+                updateProfile((current) => ({ ...current, name: event.target.value }))
+              }
+            />
+          </SettingRow>
+          <RangeSetting
+            label="Input level"
+            value={profile.pitch.inputLevel}
+            min={0.25}
+            max={2.5}
+            step={0.01}
+            suffix="x"
+            onChange={(value) =>
+              updateProfile((current) => ({
+                ...current,
+                pitch: { ...current.pitch, inputLevel: value },
+              }))
+            }
+          />
+          <div className="calibration-grid">
+            <button type="button" onClick={calibrateSilence} disabled={status === 'idle'}>
+              Calibrate silence
+            </button>
+            <button type="button" onClick={calibrateVoice} disabled={status === 'idle'}>
+              Calibrate voice
+            </button>
           </div>
+          <div className="meter-list">
+            <Meter label="Noise" value={profile.calibration.noiseFloorRms} max={0.2} />
+            <Meter label="Voice" value={profile.calibration.vocalRms} max={0.4} />
+            <Meter label="Threshold" value={profile.calibration.rmsThreshold} max={0.2} />
+          </div>
+          <div className="profile-health">
+            <strong>{profileCompleteness}% trigger training</strong>
+            <span>Five examples per slot gives the classifier enough shape.</span>
+          </div>
+          <button className="secondary-danger" type="button" onClick={resetProfile}>
+            <RotateCcw size={16} />
+            Reset profile
+          </button>
+        </aside>
+      </section>
 
+      <section className="control-matrix" aria-label="Controller modes">
+        <ModePanel title="Pitch" eyebrow="Notes and bends">
           <SettingRow label="Key">
             <select
-              value={settings.key}
+              value={profile.pitch.key}
               onChange={(event) =>
-                updateSetting(
-                  'key',
-                  event.target.value as AnalysisSettings['key'],
-                )
+                updateProfile((current) => ({
+                  ...current,
+                  pitch: { ...current.pitch, key: event.target.value as KeyName },
+                }))
               }
             >
               {KEYS.map((key) => (
@@ -545,15 +873,14 @@ function App() {
               ))}
             </select>
           </SettingRow>
-
           <SettingRow label="Scale">
             <select
-              value={settings.scale}
+              value={profile.pitch.scale}
               onChange={(event) =>
-                updateSetting(
-                  'scale',
-                  event.target.value as AnalysisSettings['scale'],
-                )
+                updateProfile((current) => ({
+                  ...current,
+                  pitch: { ...current.pitch, scale: event.target.value as ScaleName },
+                }))
               }
             >
               {SCALES.map((scale) => (
@@ -563,199 +890,150 @@ function App() {
               ))}
             </select>
           </SettingRow>
-
-          <div className="suggestion">
-            Suggested: {suggestedKey.key} {titleCase(suggestedKey.scale)}
-            <span>
-              {keySuggestionLabel(
-                suggestedKey.confidence,
-                suggestedKey.fit ?? 0,
-              )}
-            </span>
-          </div>
-
-          <SettingRow label="Transpose">
+          <SettingRow label="Bend">
+            <select
+              value={profile.pitch.bendMode}
+              onChange={(event) =>
+                updateProfile((current) => ({
+                  ...current,
+                  pitch: {
+                    ...current.pitch,
+                    bendMode: event.target.value as PitchBendMode,
+                  },
+                }))
+              }
+            >
+              <option value="intellibend">IntelliBend</option>
+              <option value="trubend">TruBend</option>
+            </select>
+          </SettingRow>
+          <RangeSetting
+            label="Pitch stickiness"
+            value={profile.pitch.stickiness}
+            min={0}
+            max={1}
+            step={0.01}
+            onChange={(value) =>
+              updateProfile((current) => ({
+                ...current,
+                pitch: { ...current.pitch, stickiness: value },
+              }))
+            }
+          />
+          <SettingRow label="Octave">
             <input
               type="number"
-              min={-24}
-              max={24}
-              value={settings.transpose}
+              min={-3}
+              max={3}
+              value={profile.pitch.octave}
               onChange={(event) =>
-                updateSetting('transpose', Number(event.target.value))
+                updateProfile((current) => ({
+                  ...current,
+                  pitch: { ...current.pitch, octave: Number(event.target.value) },
+                }))
               }
             />
           </SettingRow>
+          <label className="toggle-row">
+            <input
+              type="checkbox"
+              checked={profile.pitch.keyLock}
+              onChange={(event) =>
+                updateProfile((current) => ({
+                  ...current,
+                  pitch: { ...current.pitch, keyLock: event.target.checked },
+                }))
+              }
+            />
+            Key lock
+          </label>
+        </ModePanel>
 
-          <section className="preset-section" aria-label="Correction preset">
-            <div className="preset-section-heading">
-              <span>Correction preset</span>
-              <strong>
-                {activePreset === 'custom'
-                  ? 'Custom'
-                  : presetLabel(activePreset)}
-              </strong>
-            </div>
-            <div className="preset-list">
-              {CORRECTION_PRESETS.map((preset) => (
-                <button
-                  className={
-                    activePreset === preset.id
-                      ? 'preset-option selected'
-                      : 'preset-option'
-                  }
-                  key={preset.id}
-                  type="button"
-                  onClick={() => applyCorrectionPreset(preset.id)}
-                  aria-pressed={activePreset === preset.id}
-                >
-                  <strong>{preset.label}</strong>
-                  <span>{preset.description}</span>
-                </button>
-              ))}
-            </div>
-          </section>
+        <ModePanel title="Triggers" eyebrow="Percussive slots">
+          <div className="trigger-list">
+            {profile.triggers.map((slot) => (
+              <TriggerSlotRow
+                key={slot.id}
+                slot={slot}
+                onTrain={() => trainTrigger(slot.id)}
+                onReset={() => resetTrigger(slot.id)}
+                onToggle={(enabled) =>
+                  updateProfile((current) => ({
+                    ...current,
+                    triggers: current.triggers.map((candidate) =>
+                      candidate.id === slot.id ? { ...candidate, enabled } : candidate,
+                    ),
+                  }))
+                }
+                onMidiChange={(midi) =>
+                  updateProfile((current) => ({
+                    ...current,
+                    triggers: current.triggers.map((candidate) =>
+                      candidate.id === slot.id ? { ...candidate, midi } : candidate,
+                    ),
+                  }))
+                }
+              />
+            ))}
+          </div>
+        </ModePanel>
 
-          <SettingRow label="BPM">
+        <ModePanel title="CC" eyebrow="Voice-controlled effects">
+          <div className="cc-list">
+            {profile.ccMappings.map((mapping) => (
+              <CcMappingRow
+                key={mapping.id}
+                mapping={mapping}
+                onChange={(next) =>
+                  updateProfile((current) => ({
+                    ...current,
+                    ccMappings: current.ccMappings.map((candidate) =>
+                      candidate.id === mapping.id ? next : candidate,
+                    ),
+                  }))
+                }
+              />
+            ))}
+          </div>
+          <RangeSetting
+            label="Smoothing"
+            value={profile.ccSmoothing}
+            min={0}
+            max={0.95}
+            step={0.01}
+            onChange={(value) =>
+              updateProfile((current) => ({
+                ...current,
+                ccSmoothing: value,
+              }))
+            }
+          />
+        </ModePanel>
+      </section>
+
+      <section className="capture-panel" aria-label="Capture output">
+        <PanelHeading eyebrow="Capture" title="Cleaned MIDI clip">
+          {status === 'processing' ? <LoaderCircle className="spin" size={18} /> : null}
+        </PanelHeading>
+        <div className="capture-stats">
+          <Stat label="Duration" value={clip ? `${clip.duration.toFixed(2)}s` : '0.00s'} />
+          <Stat label="Notes" value={clip ? String(clip.cleanedNotes.length) : '0'} />
+          <Stat
+            label="Suggested key"
+            value={clip ? `${clip.suggestedKey.key} ${clip.suggestedKey.scale}` : `${profile.pitch.key} ${profile.pitch.scale}`}
+          />
+          <label className="tempo-control">
+            <span>BPM</span>
             <input
               type="number"
               min={40}
               max={240}
-              value={settings.tempo}
-              onChange={(event) =>
-                updateSetting('tempo', Number(event.target.value))
-              }
+              value={tempo}
+              onChange={(event) => setTempo(Number(event.target.value))}
             />
-          </SettingRow>
-
-          <SettingRow label="Grid">
-            <select
-              value={settings.grid}
-              onChange={(event) =>
-                updateSetting('grid', Number(event.target.value))
-              }
-            >
-              {GRID_OPTIONS.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
-            </select>
-          </SettingRow>
-
-          <details className="advanced-settings">
-            <summary>
-              <span>Advanced cleanup</span>
-              <SlidersHorizontal size={16} />
-            </summary>
-
-            <div className="advanced-settings-content">
-              <RangeSetting
-                label="Noise cleanup"
-                value={settings.noiseCleanup}
-                onChange={(value) => updateSetting('noiseCleanup', value)}
-              />
-
-              <RangeSetting
-                label="Articulation cleanup"
-                value={settings.articulationCleanup}
-                onChange={(value) => updateSetting('articulationCleanup', value)}
-              />
-
-              <RangeSetting
-                label="Pitch correction"
-                value={settings.correctionStrength}
-                onChange={(value) => updateSetting('correctionStrength', value)}
-              />
-
-              <RangeSetting
-                label="Rhythm quantize"
-                value={settings.quantizeStrength}
-                onChange={(value) => updateSetting('quantizeStrength', value)}
-              />
-
-              <label className="toggle-row">
-                <input
-                  type="checkbox"
-                  checked={settings.exportPitchBends}
-                  onChange={(event) =>
-                    updateSetting('exportPitchBends', event.target.checked)
-                  }
-                />
-                Export pitch bends
-              </label>
-            </div>
-          </details>
-        </aside>
-      </section>
-
-      <section className="note-table-section">
-        <div className="panel-heading">
-          <div>
-            <p className="eyebrow">Notes</p>
-            <h2>Editable output</h2>
-          </div>
-          <span className="note-count">{adjustedNotes.length} notes</span>
+          </label>
         </div>
-
-        <div className="table-wrap">
-          <table>
-            <thead>
-              <tr>
-                <th>Raw</th>
-                <th>Corrected</th>
-                <th>Start</th>
-                <th>Duration</th>
-                <th>Confidence</th>
-                <th>Adjust</th>
-              </tr>
-            </thead>
-            <tbody>
-              {adjustedNotes.length > 0 ? (
-                adjustedNotes.map((note) => (
-                  <tr key={note.id}>
-                    <td>{note.rawNoteName}</td>
-                    <td>{note.noteName}</td>
-                    <td>{formatSeconds(note.quantizedStart)}</td>
-                    <td>{formatSeconds(note.quantizedDuration)}</td>
-                    <td>{Math.round(note.confidence * 100)}%</td>
-                    <td>
-                      <div className="note-actions">
-                        <button
-                          type="button"
-                          title="Raise one semitone"
-                          onClick={() => nudgeNote(note.id, 1)}
-                        >
-                          <ChevronUp size={16} />
-                        </button>
-                        <button
-                          type="button"
-                          title="Lower one semitone"
-                          onClick={() => nudgeNote(note.id, -1)}
-                        >
-                          <ChevronDown size={16} />
-                        </button>
-                        <button
-                          type="button"
-                          title="Reset note"
-                          onClick={() => resetNote(note.id)}
-                          disabled={!manualEdits[note.id]}
-                        >
-                          <RotateCcw size={16} />
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                ))
-              ) : (
-                <tr>
-                  <td colSpan={6} className="empty-row">
-                    Analyze a recording to generate editable notes.
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-        </div>
+        <CapturedNotesTable clip={clip} />
       </section>
     </main>
   )
@@ -763,70 +1041,203 @@ function App() {
 
 export default App
 
-interface TimelineProps {
-  rawNotes: RawTranscription['notes']
-  adjustedNotes: AdjustedNote[]
-  duration: number
+interface KeyConfidenceWheelProps {
+  note: string
+  cents: number
+  confidence: number
+  rms: number
+  threshold: number
+  voiced: boolean
+  keyName: KeyName
+  scaleName: ScaleName
+  lockedMidi: number | null
 }
 
-function Timeline({ rawNotes, adjustedNotes, duration }: TimelineProps) {
-  const notes = [...rawNotes, ...adjustedNotes]
-  const minMidi = Math.min(55, ...notes.map((note) => Math.round(note.midi) - 2))
-  const maxMidi = Math.max(76, ...notes.map((note) => Math.round(note.midi) + 2))
-  const midiRange = Math.max(1, maxMidi - minMidi)
-  const safeDuration = Math.max(1, duration)
+function KeyConfidenceWheel({
+  note,
+  cents,
+  confidence,
+  rms,
+  threshold,
+  voiced,
+  keyName,
+  scaleName,
+  lockedMidi,
+}: KeyConfidenceWheelProps) {
+  const wheelNotes = keyWheelNotes(keyName, scaleName)
+  const activeChroma =
+    lockedMidi === null ? null : ((Math.round(lockedMidi) % 12) + 12) % 12
+  const activeIndex = wheelNotes.findIndex((wheelNote) => wheelNote.chroma === activeChroma)
+  const inputStrength = clamp(rms / Math.max(0.001, threshold * 4), 0, 1)
+  const strength = voiced ? clamp(confidence * 0.68 + inputStrength * 0.32, 0, 1) : 0
+  const segmentAngle = 360 / wheelNotes.length
+  const activeAngle =
+    activeIndex >= 0
+      ? activeIndex * segmentAngle + segmentAngle / 2 - 90 + clamp(cents / 50, -0.42, 0.42) * segmentAngle
+      : -90
+  const rayEnd = polarPoint(150, 150, 64 + strength * 62, activeAngle)
+  const displayNote = stripOctave(note)
 
-  function xFor(seconds: number) {
-    return (seconds / safeDuration) * 1000
+  return (
+    <div className={voiced ? 'pitch-wheel active' : 'pitch-wheel'}>
+      <svg className="key-wheel-svg" viewBox="0 0 300 300" role="img">
+        <title>
+          {keyName} {scaleName} confidence wheel
+        </title>
+        {wheelNotes.map((wheelNote, index) => {
+          const isActive = index === activeIndex && voiced
+          const startAngle = index * segmentAngle - 90 + 1.2
+          const endAngle = (index + 1) * segmentAngle - 90 - 1.2
+          const outerRadius = 106 + (isActive ? strength * 34 : 0)
+
+          return (
+            <g key={wheelNote.label}>
+              <path
+                className={isActive ? 'wheel-segment active' : 'wheel-segment'}
+                d={ringSegmentPath(150, 150, 74, outerRadius, startAngle, endAngle)}
+                style={{
+                  opacity: isActive ? 0.66 + strength * 0.34 : 1,
+                }}
+              />
+              <text
+                className={isActive ? 'wheel-label active' : 'wheel-label'}
+                x={polarPoint(150, 150, 126, startAngle + segmentAngle / 2).x}
+                y={polarPoint(150, 150, 126, startAngle + segmentAngle / 2).y}
+                textAnchor="middle"
+                dominantBaseline="middle"
+              >
+                {wheelNote.label}
+              </text>
+            </g>
+          )
+        })}
+        <circle className="wheel-inner-ring" cx="150" cy="150" r="68" />
+        <circle className="wheel-core" cx="150" cy="150" r="31" />
+        {voiced ? (
+          <line
+            className="wheel-ray"
+            x1="150"
+            y1="150"
+            x2={rayEnd.x}
+            y2={rayEnd.y}
+            style={{
+              strokeWidth: 8 + strength * 18,
+              opacity: 0.38 + strength * 0.5,
+            }}
+          />
+        ) : null}
+        <text className="wheel-center-note" x="150" y="145" textAnchor="middle">
+          {displayNote}
+        </text>
+        <text className="wheel-center-cents" x="150" y="174" textAnchor="middle">
+          {cents > 0 ? '+' : ''}
+          {cents} cents
+        </text>
+      </svg>
+      <div className="wheel-meters">
+        <Meter label="Confidence" value={confidence} max={1} />
+        <div className="horizontal-meter">
+          <span>Input</span>
+          <strong>{Math.round(inputStrength * 100)}%</strong>
+          <i style={{ width: `${inputStrength * 100}%` }} />
+        </div>
+        <div className="horizontal-meter">
+          <span>Strength</span>
+          <strong>{Math.round(strength * 100)}%</strong>
+          <i style={{ width: `${strength * 100}%` }} />
+        </div>
+      </div>
+    </div>
+  )
+}
+
+interface LiveTimelineProps {
+  frames: LivePitchFrame[]
+  clip: CapturedClip | null
+}
+
+function LiveTimeline({ frames, clip }: LiveTimelineProps) {
+  const voiced = frames.filter((frame) => frame.lockedMidi !== null)
+  const minMidi = Math.min(48, ...voiced.map((frame) => (frame.lockedMidi ?? 60) - 2))
+  const maxMidi = Math.max(84, ...voiced.map((frame) => (frame.lockedMidi ?? 60) + 2))
+  const midiRange = Math.max(1, maxMidi - minMidi)
+  const startTime = frames[0]?.time ?? 0
+  const duration = Math.max(1, (frames[frames.length - 1]?.time ?? 1) - startTime)
+
+  function xFor(time: number) {
+    return ((time - startTime) / duration) * 900 + 20
   }
 
   function yFor(midi: number) {
-    return 260 - ((midi - minMidi) / midiRange) * 220
+    return 180 - ((midi - minMidi) / midiRange) * 140
   }
 
   return (
-    <svg className="timeline" viewBox="0 0 1000 300" role="img">
-      <title>Detected and corrected note timeline</title>
-      {Array.from({ length: 9 }, (_, index) => {
-        const x = (index / 8) * 1000
-        return <line key={`time-${index}`} x1={x} y1="24" x2={x} y2="270" />
-      })}
-      {Array.from({ length: 7 }, (_, index) => {
-        const y = 40 + index * 36
-        return <line key={`pitch-${index}`} x1="0" y1={y} x2="1000" y2={y} />
-      })}
-      {rawNotes.map((note) => (
-        <rect
-          key={`raw-${note.id}`}
-          className="raw-note"
-          x={xFor(note.start)}
-          y={yFor(note.midi) - 7}
-          width={Math.max(4, xFor(note.duration))}
-          height="14"
-          rx="3"
+    <svg className="live-timeline" viewBox="0 0 940 220" role="img">
+      <title>Live pitch and captured notes</title>
+      {Array.from({ length: 8 }, (_, index) => (
+        <line key={`grid-${index}`} x1={20 + index * 128} x2={20 + index * 128} y1="24" y2="190" />
+      ))}
+      {voiced.map((frame, index) => (
+        <circle
+          key={`${frame.time}-${index}`}
+          cx={xFor(frame.time)}
+          cy={yFor(frame.lockedMidi ?? 60)}
+          r={Math.max(2, frame.confidence * 5)}
         />
       ))}
-      {adjustedNotes.map((note) => (
+      {clip?.cleanedNotes.map((note) => (
         <rect
-          key={`adjusted-${note.id}`}
-          className="adjusted-note"
-          x={xFor(note.quantizedStart)}
-          y={yFor(note.midi) - 9}
-          width={Math.max(5, xFor(note.quantizedDuration))}
-          height="18"
-          rx="4"
+          key={note.id}
+          x={(note.start / Math.max(1, clip.duration)) * 900 + 20}
+          y={yFor(note.midi) - 8}
+          width={Math.max(5, (note.duration / Math.max(1, clip.duration)) * 900)}
+          height="16"
+          rx="3"
         />
       ))}
     </svg>
   )
 }
 
-interface SettingRowProps {
-  label: string
-  children: ReactNode
+function PanelHeading({
+  eyebrow,
+  title,
+  children,
+}: {
+  eyebrow: string
+  title: string
+  children?: ReactNode
+}) {
+  return (
+    <div className="panel-heading compact-heading">
+      <div>
+        <p className="eyebrow">{eyebrow}</p>
+        <h2>{title}</h2>
+      </div>
+      {children}
+    </div>
+  )
 }
 
-function SettingRow({ label, children }: SettingRowProps) {
+function ModePanel({
+  title,
+  eyebrow,
+  children,
+}: {
+  title: string
+  eyebrow: string
+  children: ReactNode
+}) {
+  return (
+    <section className="mode-panel">
+      <PanelHeading eyebrow={eyebrow} title={title} />
+      {children}
+    </section>
+  )
+}
+
+function SettingRow({ label, children }: { label: string; children: ReactNode }) {
   return (
     <label className="setting-row">
       <span>{label}</span>
@@ -835,26 +1246,176 @@ function SettingRow({ label, children }: SettingRowProps) {
   )
 }
 
-interface RangeSettingProps {
+function RangeSetting({
+  label,
+  value,
+  min,
+  max,
+  step,
+  suffix = '',
+  onChange,
+}: {
   label: string
   value: number
+  min: number
+  max: number
+  step: number
+  suffix?: string
   onChange: (value: number) => void
-}
+}) {
+  const displayValue =
+    suffix || max > 1 ? `${value.toFixed(suffix ? 2 : 0)}${suffix}` : `${Math.round(value * 100)}%`
 
-function RangeSetting({ label, value, onChange }: RangeSettingProps) {
   return (
     <label className="setting-row range-row">
       <span>{label}</span>
       <input
         type="range"
-        min="0"
-        max="1"
-        step="0.01"
+        min={min}
+        max={max}
+        step={step}
         value={value}
         onChange={(event) => onChange(Number(event.target.value))}
       />
-      <strong>{Math.round(value * 100)}%</strong>
+      <strong>{displayValue}</strong>
     </label>
+  )
+}
+
+function TriggerSlotRow({
+  slot,
+  onTrain,
+  onReset,
+  onToggle,
+  onMidiChange,
+}: {
+  slot: TriggerSlot
+  onTrain: () => void
+  onReset: () => void
+  onToggle: (enabled: boolean) => void
+  onMidiChange: (midi: number) => void
+}) {
+  return (
+    <div className="trigger-slot">
+      <label className="toggle-row">
+        <input
+          type="checkbox"
+          checked={slot.enabled}
+          onChange={(event) => onToggle(event.target.checked)}
+        />
+        <strong>{slot.label}</strong>
+      </label>
+      <input
+        type="number"
+        min={0}
+        max={127}
+        value={slot.midi}
+        onChange={(event) => onMidiChange(Number(event.target.value))}
+      />
+      <span>{slot.examples.length}/5</span>
+      <button type="button" onClick={onTrain}>
+        Train
+      </button>
+      <button type="button" onClick={onReset}>
+        Reset
+      </button>
+    </div>
+  )
+}
+
+function CcMappingRow({
+  mapping,
+  onChange,
+}: {
+  mapping: CcMapping
+  onChange: (mapping: CcMapping) => void
+}) {
+  return (
+    <div className="cc-row">
+      <label className="toggle-row">
+        <input
+          type="checkbox"
+          checked={mapping.enabled}
+          onChange={(event) => onChange({ ...mapping, enabled: event.target.checked })}
+        />
+        <strong>{mapping.label}</strong>
+      </label>
+      <select
+        value={mapping.source}
+        onChange={(event) => onChange({ ...mapping, source: event.target.value as CcSource })}
+      >
+        {CC_SOURCES.map((source) => (
+          <option key={source.value} value={source.value}>
+            {source.label}
+          </option>
+        ))}
+      </select>
+      <input
+        type="number"
+        min={0}
+        max={127}
+        value={mapping.cc}
+        onChange={(event) => onChange({ ...mapping, cc: Number(event.target.value) })}
+      />
+    </div>
+  )
+}
+
+function CapturedNotesTable({ clip }: { clip: CapturedClip | null }) {
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Note</th>
+            <th>Start</th>
+            <th>Duration</th>
+            <th>Velocity</th>
+            <th>Bends</th>
+          </tr>
+        </thead>
+        <tbody>
+          {clip && clip.cleanedNotes.length > 0 ? (
+            clip.cleanedNotes.map((note) => (
+              <tr key={note.id}>
+                <td>{note.noteName}</td>
+                <td>{note.start.toFixed(2)}s</td>
+                <td>{note.duration.toFixed(2)}s</td>
+                <td>{Math.round(note.velocity * 100)}%</td>
+                <td>{note.pitchBends.length}</td>
+              </tr>
+            ))
+          ) : (
+            <tr>
+              <td className="empty-row" colSpan={5}>
+                Capture a vocal performance to create a cleaned MIDI clip.
+              </td>
+            </tr>
+          )}
+        </tbody>
+      </table>
+    </div>
+  )
+}
+
+function Meter({ label, value, max }: { label: string; value: number; max: number }) {
+  const width = Math.max(0, Math.min(100, (value / max) * 100))
+
+  return (
+    <div className="horizontal-meter">
+      <span>{label}</span>
+      <strong>{value.toFixed(3)}</strong>
+      <i style={{ width: `${width}%` }} />
+    </div>
+  )
+}
+
+function Stat({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="stat">
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
   )
 }
 
@@ -870,16 +1431,28 @@ function preferredMimeType(): string {
   )
 }
 
-function statusLabel(status: AppStatus): string {
+function average(values: number[]): number {
+  if (values.length === 0) {
+    return 0
+  }
+
+  return values.reduce((sum, value) => sum + value, 0) / values.length
+}
+
+function titleCase(value: string): string {
+  return value.replace(/\b\w/g, (letter) => letter.toUpperCase())
+}
+
+function statusLabel(status: ControllerStatus): string {
   switch (status) {
-    case 'recording':
-      return 'Recording'
-    case 'analyzing':
-      return 'Analyzing'
-    case 'ready':
-      return 'Ready'
-    case 'complete':
-      return 'Notes ready'
+    case 'capturing':
+      return 'Capturing'
+    case 'processing':
+      return 'Cleaning capture'
+    case 'calibrating':
+      return 'Calibrating'
+    case 'monitoring':
+      return 'Live'
     case 'idle':
       return 'Idle'
   }
@@ -889,33 +1462,65 @@ function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Something went wrong.'
 }
 
-function formatSeconds(seconds: number): string {
-  return `${seconds.toFixed(2)}s`
+function midiToFrequency(midi: number): number {
+  return 440 * 2 ** ((midi - 69) / 12)
 }
 
-function titleCase(value: string): string {
-  return value.replace(/\b\w/g, (letter) => letter.toUpperCase())
+function keyWheelNotes(keyName: KeyName, scaleName: ScaleName) {
+  const notes = Scale.get(`${keyName} ${scaleName}`).notes
+  if (notes.length > 0) {
+    return notes
+      .map((note) => ({
+        label: note,
+        chroma: Note.get(note).chroma,
+      }))
+      .filter((note): note is { label: string; chroma: number } => note.chroma !== undefined)
+  }
+
+  return [
+    { label: keyName, chroma: Note.get(keyName).chroma ?? 0 },
+    { label: 'V', chroma: (Note.get(keyName).chroma ?? 0) + 7 },
+  ].map((note) => ({
+    ...note,
+    chroma: ((note.chroma % 12) + 12) % 12,
+  }))
 }
 
-function keySuggestionLabel(confidence: number, fit: number): string {
-  if (fit < 0.55) {
-    return 'Weak fit'
-  }
+function ringSegmentPath(
+  cx: number,
+  cy: number,
+  innerRadius: number,
+  outerRadius: number,
+  startAngle: number,
+  endAngle: number,
+): string {
+  const outerStart = polarPoint(cx, cy, outerRadius, startAngle)
+  const outerEnd = polarPoint(cx, cy, outerRadius, endAngle)
+  const innerEnd = polarPoint(cx, cy, innerRadius, endAngle)
+  const innerStart = polarPoint(cx, cy, innerRadius, startAngle)
+  const largeArc = endAngle - startAngle > 180 ? 1 : 0
 
-  if (confidence < 0.08) {
-    return 'Ambiguous key'
-  }
-
-  if (confidence < 0.18) {
-    return 'Possible key'
-  }
-
-  return 'Clear key'
+  return [
+    `M ${outerStart.x} ${outerStart.y}`,
+    `A ${outerRadius} ${outerRadius} 0 ${largeArc} 1 ${outerEnd.x} ${outerEnd.y}`,
+    `L ${innerEnd.x} ${innerEnd.y}`,
+    `A ${innerRadius} ${innerRadius} 0 ${largeArc} 0 ${innerStart.x} ${innerStart.y}`,
+    'Z',
+  ].join(' ')
 }
 
-function presetLabel(presetId: CorrectionPresetId): string {
-  return (
-    CORRECTION_PRESETS.find((preset) => preset.id === presetId)?.label ??
-    'Balanced'
-  )
+function polarPoint(cx: number, cy: number, radius: number, angleDegrees: number) {
+  const radians = (angleDegrees * Math.PI) / 180
+  return {
+    x: cx + radius * Math.cos(radians),
+    y: cy + radius * Math.sin(radians),
+  }
+}
+
+function stripOctave(note: string): string {
+  return note.replace(/-?\d+$/, '')
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value))
 }
