@@ -32,6 +32,10 @@ const MAX_WOBBLE_GAP_SECONDS = 0.14
 const MAX_WOBBLE_SEMITONES = 1
 const ISOLATED_JUMP_SEMITONES = 10
 const MAX_PITCH_BENDS_PER_NOTE = 48
+const MIN_SOFT_RMS_THRESHOLD = 0.006
+const QUIET_FRAME_MIN_CONFIDENCE = 0.82
+const MAX_PITCH_REFERENCE_GAP_SECONDS = 0.24
+const LOW_ENERGY_RELEASE_FRAMES = 2
 
 export interface PitchEstimate {
   frequency: number
@@ -40,12 +44,22 @@ export interface PitchEstimate {
   yin: number
 }
 
+export interface PitchEstimateOptions {
+  referenceMidi?: number | null
+  referenceConfidence?: number
+}
+
 export interface LiveEngineState {
   activeMidi: number | null
   activeStartedAt: number
+  activePeakRms: number
+  activeLowEnergyFrames: number
   pendingMidi: number | null
   pendingStartedAt: number
   lastFrameTime: number
+  lastEstimatedMidi: number | null
+  lastVoicedAt: number
+  lastPitchConfidence: number
   ccValues: Map<number, number>
 }
 
@@ -74,6 +88,7 @@ export function createDefaultCalibration(): VocalCalibration {
     noiseFloorRms: 0.012,
     vocalRms: 0.12,
     rmsThreshold: 0.03,
+    inputLevel: 1,
     minMidi: 42,
     maxMidi: 84,
     yinThreshold: DEFAULT_YIN_THRESHOLD,
@@ -84,10 +99,115 @@ export function createLiveEngineState(): LiveEngineState {
   return {
     activeMidi: null,
     activeStartedAt: 0,
+    activePeakRms: 0,
+    activeLowEnergyFrames: 0,
     pendingMidi: null,
     pendingStartedAt: 0,
     lastFrameTime: 0,
+    lastEstimatedMidi: null,
+    lastVoicedAt: 0,
+    lastPitchConfidence: 0,
     ccValues: new Map(),
+  }
+}
+
+export function effectiveInputThreshold(
+  calibration: VocalCalibration,
+  currentInputLevel = calibration.inputLevel,
+): number {
+  const calibrationInputLevel = Math.max(0.05, calibration.inputLevel || 1)
+  const inputRatio = Math.max(0.25, currentInputLevel) / calibrationInputLevel
+  const adaptiveFloor = Math.max(
+    MIN_SOFT_RMS_THRESHOLD,
+    calibration.noiseFloorRms * 1.6,
+    calibration.vocalRms * 0.08,
+  )
+
+  return Math.min(calibration.rmsThreshold, adaptiveFloor) * inputRatio
+}
+
+export function scaledRmsThreshold(
+  calibration: VocalCalibration,
+  currentInputLevel = calibration.inputLevel,
+): number {
+  const calibrationInputLevel = Math.max(0.05, calibration.inputLevel || 1)
+  const inputRatio = Math.max(0.25, currentInputLevel) / calibrationInputLevel
+  return calibration.rmsThreshold * inputRatio
+}
+
+export type CalibrationFeedback =
+  | 'tooQuiet'
+  | 'stableVoiceCaptured'
+  | 'pitchRangeUnchanged'
+
+export interface VoiceCalibrationUpdate {
+  calibration: VocalCalibration
+  feedback: CalibrationFeedback
+}
+
+export function calibrateSilenceFromFrames(
+  current: VocalCalibration,
+  frames: LivePitchFrame[],
+  inputLevel: number,
+): VocalCalibration | null {
+  const rmsValues = sortedPositiveRms(frames)
+  if (rmsValues.length === 0) {
+    return null
+  }
+
+  const floor = percentile(rmsValues, 0.2)
+  return {
+    ...current,
+    inputLevel,
+    noiseFloorRms: floor,
+    rmsThreshold: Math.max(floor * 2.4, 0.008),
+  }
+}
+
+export function calibrateVoiceFromFrames(
+  current: VocalCalibration,
+  frames: LivePitchFrame[],
+  inputLevel: number,
+): VoiceCalibrationUpdate | null {
+  const voiceFloor = Math.max(current.noiseFloorRms * 1.35, MIN_SOFT_RMS_THRESHOLD * 0.8)
+  const rmsValues = sortedPositiveRms(frames).filter((value) => value >= voiceFloor)
+  if (rmsValues.length === 0) {
+    return null
+  }
+
+  const measuredVocalRms = Math.max(average(rmsValues), percentile(rmsValues, 0.65))
+  const vocalRms = Math.max(measuredVocalRms, current.noiseFloorRms * 6)
+  const stablePitchFrames = frames.filter(
+    (frame) =>
+      frame.estimatedMidi !== null &&
+      frame.rms >= voiceFloor &&
+      frame.confidence >= 0.7,
+  )
+  const midiValues = stablePitchFrames
+    .map((frame) => frame.estimatedMidi)
+    .filter((midi): midi is number => midi !== null)
+  const hasStablePitchRange = midiValues.length >= 3
+  const tooQuiet =
+    measuredVocalRms < Math.max(current.noiseFloorRms * 4, MIN_SOFT_RMS_THRESHOLD * 2)
+
+  return {
+    calibration: {
+      ...current,
+      inputLevel,
+      vocalRms,
+      rmsThreshold: Math.max(
+        current.noiseFloorRms * 2.4,
+        vocalRms * 0.12,
+        0.008,
+      ),
+      minMidi: hasStablePitchRange ? Math.floor(Math.min(...midiValues) - 10) : current.minMidi,
+      maxMidi: hasStablePitchRange ? Math.ceil(Math.max(...midiValues) + 10) : current.maxMidi,
+    },
+    feedback: tooQuiet
+      ? 'tooQuiet'
+      : hasStablePitchRange
+        ? 'stableVoiceCaptured'
+        : 'pitchRangeUnchanged',
   }
 }
 
@@ -95,6 +215,7 @@ export function estimatePitchYin(
   samples: Float32Array,
   sampleRate: number,
   threshold = DEFAULT_YIN_THRESHOLD,
+  options: PitchEstimateOptions = {},
 ): PitchEstimate | null {
   const minTau = Math.max(2, Math.floor(sampleRate / MAX_PITCH_HZ))
   const maxTau = Math.min(
@@ -123,44 +244,15 @@ export function estimatePitchYin(
     cumulative[tau] = runningTotal > 0 ? (difference[tau] * tau) / runningTotal : 1
   }
 
-  let bestTau = -1
-  for (let tau = minTau; tau <= maxTau; tau += 1) {
-    if (cumulative[tau] < threshold) {
-      bestTau = tau
-      while (bestTau + 1 <= maxTau && cumulative[bestTau + 1] < cumulative[bestTau]) {
-        bestTau += 1
-      }
-      break
-    }
-  }
-
-  if (bestTau < 0) {
-    let bestValue = Number.POSITIVE_INFINITY
-    for (let tau = minTau; tau <= maxTau; tau += 1) {
-      if (cumulative[tau] < bestValue) {
-        bestValue = cumulative[tau]
-        bestTau = tau
-      }
-    }
-    if (bestValue > threshold * 1.35) {
-      return null
-    }
-  }
-
-  const refinedTau = parabolicTau(cumulative, bestTau)
-  const frequency = sampleRate / refinedTau
-  const midi = frequencyToMidi(frequency)
-  if (!Number.isFinite(midi)) {
-    return null
-  }
-
-  const yin = cumulative[bestTau]
-  return {
-    frequency,
-    midi,
-    yin,
-    confidence: Math.max(0, Math.min(1, 1 - yin)),
-  }
+  const candidates = pitchCandidatesFromCumulative(
+    cumulative,
+    minTau,
+    maxTau,
+    sampleRate,
+    threshold,
+    options,
+  )
+  return candidates[0] ?? null
 }
 
 export function analyzeLiveFrame(
@@ -172,20 +264,47 @@ export function analyzeLiveFrame(
 ): LiveFrameResult {
   const filtered = bandLimit(samples, sampleRate)
   const rmsValue = rms(filtered)
+  const inputThreshold = effectiveInputThreshold(
+    profile.calibration,
+    profile.pitch.inputLevel,
+  )
+  const rmsThreshold = scaledRmsThreshold(
+    profile.calibration,
+    profile.pitch.inputLevel,
+  )
   const estimate =
-    rmsValue >= profile.calibration.rmsThreshold
+    rmsValue >= inputThreshold
       ? estimatePitchYin(
           filtered,
           sampleRate,
           profile.calibration.yinThreshold,
+          {
+            referenceMidi:
+              time - state.lastVoicedAt <= MAX_PITCH_REFERENCE_GAP_SECONDS
+                ? state.lastEstimatedMidi
+                : null,
+            referenceConfidence:
+              time - state.lastVoicedAt <= MAX_PITCH_REFERENCE_GAP_SECONDS
+                ? state.lastPitchConfidence
+                : 0,
+          },
         )
       : null
+  const isQuietFrame = rmsValue < rmsThreshold
+  const strongEnoughForQuietFrame =
+    !isQuietFrame || (estimate?.confidence ?? 0) >= QUIET_FRAME_MIN_CONFIDENCE
   const inRange =
     estimate &&
+    strongEnoughForQuietFrame &&
     estimate.midi >= profile.calibration.minMidi &&
     estimate.midi <= profile.calibration.maxMidi
   const voiced = Boolean(inRange)
   const estimatedMidi = inRange ? estimate.midi : null
+  if (estimatedMidi !== null && estimate) {
+    state.lastEstimatedMidi = estimatedMidi
+    state.lastVoicedAt = time
+    state.lastPitchConfidence = estimate.confidence
+  }
   const lockedMidi =
     estimatedMidi === null
       ? null
@@ -244,6 +363,8 @@ export function noteEventsForFrame(
         midi: state.activeMidi,
       })
       state.activeMidi = null
+      state.activePeakRms = 0
+      state.activeLowEnergyFrames = 0
       state.pendingMidi = null
     }
     return events
@@ -251,9 +372,32 @@ export function noteEventsForFrame(
 
   const targetMidi = frame.lockedMidi
 
+  if (state.activeMidi !== null && state.activePeakRms > 0) {
+    const lowEnergyFrame = frame.rms < state.activePeakRms * 0.2
+    state.activeLowEnergyFrames = lowEnergyFrame
+      ? state.activeLowEnergyFrames + 1
+      : 0
+
+    if (state.activeLowEnergyFrames >= LOW_ENERGY_RELEASE_FRAMES) {
+      events.push({
+        id: `note-off-${frame.time}`,
+        type: 'noteOff',
+        time: frame.time,
+        midi: state.activeMidi,
+      })
+      state.activeMidi = null
+      state.activePeakRms = 0
+      state.activeLowEnergyFrames = 0
+      state.pendingMidi = null
+      return events
+    }
+  }
+
   if (state.activeMidi === null) {
     state.activeMidi = targetMidi
     state.activeStartedAt = frame.time
+    state.activePeakRms = frame.rms
+    state.activeLowEnergyFrames = 0
     events.push({
       id: `note-on-${frame.time}`,
       type: 'noteOn',
@@ -284,6 +428,8 @@ export function noteEventsForFrame(
         })
         state.activeMidi = targetMidi
         state.activeStartedAt = frame.time
+        state.activePeakRms = frame.rms
+        state.activeLowEnergyFrames = 0
         state.pendingMidi = null
       }
     } else {
@@ -302,9 +448,12 @@ export function noteEventsForFrame(
       })
       state.activeMidi = targetMidi
       state.activeStartedAt = frame.time
+      state.activePeakRms = frame.rms
+      state.activeLowEnergyFrames = 0
     }
   } else {
     state.pendingMidi = null
+    state.activePeakRms = Math.max(state.activePeakRms, frame.rms)
   }
 
   if (state.activeMidi !== null) {
@@ -443,7 +592,11 @@ export function cleanupCapturedClip(input: CaptureCleanupInput): CapturedClip {
   const notes = eventsToCapturedNotes(input.events)
   const cleanedNotes = cleanupPitchNotes(notes)
   const cleanedEvents = notesToEvents(cleanedNotes)
-  const suggestedKey = inferKeyFromFrames(input.frames, input.profile)
+  const suggestedKey = inferKeyFromPerformance(
+    cleanedNotes,
+    input.frames,
+    input.profile,
+  )
 
   return {
     duration: input.duration,
@@ -455,13 +608,58 @@ export function cleanupCapturedClip(input: CaptureCleanupInput): CapturedClip {
   }
 }
 
+export function analyzeOfflineLiveClip(
+  samples: Float32Array,
+  sampleRate: number,
+  profile: VocalProfile,
+): CapturedClip {
+  const state = createLiveEngineState()
+  const frames: LivePitchFrame[] = []
+  const events: PerformanceEvent[] = []
+
+  for (
+    let startSample = 0;
+    startSample + LIVE_FRAME_SIZE <= samples.length;
+    startSample += LIVE_HOP_SIZE
+  ) {
+    const frameSamples = samples.subarray(startSample, startSample + LIVE_FRAME_SIZE)
+    const time = startSample / sampleRate
+    const result = analyzeLiveFrame(frameSamples, sampleRate, time, profile, state)
+    frames.push(result.frame)
+    events.push(...result.events)
+  }
+
+  const duration = samples.length / sampleRate
+  if (state.activeMidi !== null) {
+    events.push({
+      id: `offline-stop-${duration}`,
+      type: 'noteOff',
+      time: duration,
+      midi: state.activeMidi,
+    })
+    state.activeMidi = null
+    state.activePeakRms = 0
+    state.activeLowEnergyFrames = 0
+  }
+
+  return cleanupCapturedClip({
+    frames,
+    events,
+    duration,
+    profile,
+  })
+}
+
 export function mergeClipWithBasicPitch(
   clip: CapturedClip,
   basicPitchNotes: DetectedNote[],
   profile?: VocalProfile,
 ): CapturedClip {
   if (basicPitchNotes.length === 0) {
-    return clip
+    return {
+      ...clip,
+      suggestedKey: inferKeyFromPerformance(clip.cleanedNotes, clip.rawFrames, profile),
+    }
   }
 
   const basicNotes = cleanupPitchNotes(
@@ -493,41 +691,155 @@ export function mergeClipWithBasicPitch(
   )
 
   if (basicNotes.length === 0) {
-    return clip
+    return {
+      ...clip,
+      suggestedKey: inferKeyFromPerformance(clip.cleanedNotes, clip.rawFrames, profile),
+    }
   }
 
   const liveNotes = cleanupPitchNotes(clip.cleanedNotes)
-  const liveCoverage = totalNoteSeconds(liveNotes)
-  const basicCoverage = totalNoteSeconds(basicNotes)
-  const liveAverageDuration = averageNoteDuration(liveNotes)
-  const basicAverageDuration = averageNoteDuration(basicNotes)
-  const basicTooSparse =
-    liveCoverage > 0.1 && basicCoverage < liveCoverage * 0.45
-  const basicTooFragmented =
-    liveNotes.length > 0 &&
-    basicNotes.length > Math.max(liveNotes.length * 2.4, liveNotes.length + 8) &&
-    basicAverageDuration < liveAverageDuration * 0.6
-  const useBasic =
-    liveNotes.length === 0 ||
-    (!basicTooSparse && !basicTooFragmented && basicCoverage >= Math.max(0.1, liveCoverage * 0.55))
-  const cleanedNotes = useBasic ? basicNotes : liveNotes
+  const fusedNotes = fuseLiveAndBasicPitchNotes(
+    liveNotes,
+    basicNotes,
+    clip.rawFrames,
+  )
+  const cleanedNotes = cleanupPitchNotes(fusedNotes.length > 0 ? fusedNotes : liveNotes)
 
   return {
     ...clip,
     cleanedNotes,
     cleanedEvents: notesToEvents(cleanedNotes),
-    suggestedKey: inferKey(
-      cleanedNotes.map((note) => ({
-        id: note.id,
-        start: note.start,
-        duration: note.duration,
-        midi: note.midi,
-        velocity: note.velocity,
-        pitchBends: note.pitchBends,
-        confidence: note.confidence,
-      })),
-    ),
+    suggestedKey: inferKeyFromPerformance(cleanedNotes, clip.rawFrames, profile),
   }
+}
+
+function fuseLiveAndBasicPitchNotes(
+  liveNotes: AdjustedNote[],
+  basicNotes: AdjustedNote[],
+  frames: LivePitchFrame[],
+): AdjustedNote[] {
+  const fused: AdjustedNote[] = []
+  const keptBasicNotes = basicNotes.filter(
+    (note) =>
+      note.confidence >= 0.35 ||
+      noteHasLiveFrameSupport(note, frames) ||
+      noteHasLiveNoteSupport(note, liveNotes),
+  )
+
+  keptBasicNotes.forEach((basicNote) => {
+    const liveNote = bestOverlappingLiveNote(basicNote, liveNotes)
+    if (!liveNote) {
+      fused.push({ ...basicNote, pitchBends: [...basicNote.pitchBends] })
+      return
+    }
+
+    fused.push(mergeBasicBoundaryWithLivePitch(basicNote, liveNote))
+  })
+
+  liveNotes.forEach((liveNote) => {
+    const overlapsKeptBasic = keptBasicNotes.some(
+      (basicNote) =>
+        overlapSeconds(liveNote, basicNote) /
+          Math.max(0.001, liveNote.duration) >=
+        0.2,
+    )
+    if (
+      !overlapsKeptBasic &&
+      liveNote.confidence >= 0.7 &&
+      liveNote.duration >= 0.12
+    ) {
+      fused.push({ ...liveNote, pitchBends: [...liveNote.pitchBends] })
+    }
+  })
+
+  return fused.sort((a, b) => a.start - b.start)
+}
+
+function noteHasLiveNoteSupport(
+  basicNote: AdjustedNote,
+  liveNotes: AdjustedNote[],
+): boolean {
+  const liveNote = bestOverlappingLiveNote(basicNote, liveNotes)
+  if (!liveNote) {
+    return false
+  }
+
+  const overlapRatio =
+    overlapSeconds(basicNote, liveNote) /
+    Math.max(0.001, Math.min(basicNote.duration, liveNote.duration))
+
+  return overlapRatio >= 0.2 && Math.abs(liveNote.midi - basicNote.midi) <= 2
+}
+
+function mergeBasicBoundaryWithLivePitch(
+  basicNote: AdjustedNote,
+  liveNote: AdjustedNote,
+): AdjustedNote {
+  const useLivePitch =
+    liveNote.confidence >= basicNote.confidence + 0.08 ||
+    (basicNote.confidence < 0.45 && Math.abs(liveNote.midi - basicNote.midi) >= 2)
+  const pitchSource = useLivePitch ? liveNote : basicNote
+  const bendSource = basicNote.confidence >= liveNote.confidence ? basicNote : liveNote
+
+  return {
+    ...basicNote,
+    id: `fused-${basicNote.id}`,
+    rawId: `${basicNote.rawId}+${liveNote.rawId}`,
+    rawMidi: pitchSource.rawMidi,
+    midi: pitchSource.midi,
+    rawNoteName: midiToNoteName(pitchSource.rawMidi),
+    noteName: midiToNoteName(pitchSource.midi),
+    velocity: Math.max(basicNote.velocity, liveNote.velocity),
+    confidence: Math.max(basicNote.confidence, liveNote.confidence),
+    pitchBends: [...bendSource.pitchBends],
+  }
+}
+
+function bestOverlappingLiveNote(
+  basicNote: AdjustedNote,
+  liveNotes: AdjustedNote[],
+): AdjustedNote | null {
+  let bestNote: AdjustedNote | null = null
+  let bestScore = 0
+
+  liveNotes.forEach((liveNote) => {
+    const overlap = overlapSeconds(basicNote, liveNote)
+    if (overlap <= 0) {
+      return
+    }
+
+    const pitchDistance = Math.abs(liveNote.midi - basicNote.midi)
+    const samePitchBonus = pitchDistance <= 2 ? 1 : 0.45
+    const score = overlap * liveNote.confidence * samePitchBonus
+    if (score > bestScore) {
+      bestScore = score
+      bestNote = liveNote
+    }
+  })
+
+  return bestScore > 0 ? bestNote : null
+}
+
+function noteHasLiveFrameSupport(
+  note: AdjustedNote,
+  frames: LivePitchFrame[],
+): boolean {
+  const overlapping = frames.filter(
+    (frame) =>
+      frame.voiced &&
+      frame.time >= note.start - 0.03 &&
+      frame.time <= note.start + note.duration + 0.03,
+  )
+  if (overlapping.length === 0) {
+    return false
+  }
+
+  const nearPitchFrames = overlapping.filter((frame) => {
+    const frameMidi = frame.lockedMidi ?? frame.estimatedMidi
+    return frameMidi !== null && Math.abs(frameMidi - note.midi) <= 1.5
+  })
+
+  return nearPitchFrames.length / overlapping.length >= 0.25
 }
 
 export function eventsToCapturedNotes(events: PerformanceEvent[]): AdjustedNote[] {
@@ -705,38 +1017,47 @@ function vowelFromSpectrum(samples: Float32Array) {
   }
 }
 
-function inferKeyFromFrames(frames: LivePitchFrame[], profile: VocalProfile) {
+export function inferKeyFromPerformance(
+  cleanedNotes: AdjustedNote[],
+  frames: LivePitchFrame[],
+  profile?: VocalProfile,
+) {
+  if (cleanedNotes.length > 0) {
+    return inferKey(
+      cleanedNotes.map((note) => ({
+        id: note.id,
+        start: note.start,
+        duration: note.duration,
+        midi: note.midi,
+        velocity: note.velocity,
+        pitchBends: note.pitchBends,
+        confidence: note.confidence,
+      })),
+    )
+  }
+
   const voiced = frames
-    .filter((frame) => frame.lockedMidi !== null)
+    .filter((frame) => frame.estimatedMidi !== null)
     .map((frame, index) => ({
       id: `frame-${index}`,
       start: frame.time,
       duration: LIVE_HOP_SIZE / LIVE_SAMPLE_RATE,
-      midi: frame.lockedMidi ?? 60,
-      velocity: velocityFromRms(frame.rms),
+      midi: frame.estimatedMidi ?? 60,
+      velocity: velocityFromRms(frame.rms) * Math.max(0.25, frame.confidence),
       pitchBends: [],
       confidence: frame.confidence,
     }))
 
   if (voiced.length === 0) {
     return {
-      key: profile.pitch.key,
-      scale: profile.pitch.scale,
+      key: profile?.pitch.key ?? 'C',
+      scale: profile?.pitch.scale ?? 'major',
       confidence: 0,
       ambiguous: true,
     }
   }
 
-  const byPitch = new Map<number, typeof voiced[number]>()
-  voiced.forEach((note) => {
-    const key = Math.round(note.midi)
-    const current = byPitch.get(key)
-    if (!current || note.confidence > current.confidence) {
-      byPitch.set(key, note)
-    }
-  })
-
-  return inferKey([...byPitch.values()])
+  return inferKey(voiced)
 }
 
 function pitchBendsForNote(
@@ -928,6 +1249,12 @@ function noteWeight(note: AdjustedNote): number {
   return Math.max(0.05, note.duration) * Math.max(0.1, note.velocity) * Math.max(0.2, note.confidence)
 }
 
+function overlapSeconds(first: AdjustedNote, second: AdjustedNote): number {
+  const start = Math.max(first.start, second.start)
+  const end = Math.min(first.start + first.duration, second.start + second.duration)
+  return Math.max(0, end - start)
+}
+
 function samplePitchBends(values: number[], limit: number): number[] {
   if (values.length <= limit) {
     return [...values]
@@ -941,18 +1268,6 @@ function samplePitchBends(values: number[], limit: number): number[] {
     const sourceIndex = Math.round(((values.length - 1) * index) / (limit - 1))
     return values[sourceIndex] ?? 0
   })
-}
-
-function totalNoteSeconds(notes: AdjustedNote[]): number {
-  return notes.reduce((sum, note) => sum + Math.max(0, note.duration), 0)
-}
-
-function averageNoteDuration(notes: AdjustedNote[]): number {
-  if (notes.length === 0) {
-    return 0
-  }
-
-  return totalNoteSeconds(notes) / notes.length
 }
 
 function monophonizeNotes(notes: AdjustedNote[]): AdjustedNote[] {
@@ -1040,6 +1355,156 @@ function bandLimit(samples: Float32Array, sampleRate: number): Float32Array {
   return applyOnePoleLowPass(highPassed, sampleRate, 1200)
 }
 
+function pitchCandidatesFromCumulative(
+  cumulative: Float32Array,
+  minTau: number,
+  maxTau: number,
+  sampleRate: number,
+  threshold: number,
+  options: PitchEstimateOptions,
+): PitchEstimate[] {
+  const candidates = new Map<number, PitchEstimate>()
+  const relaxedThreshold = threshold * 1.35
+  let thresholdCandidate: PitchEstimate | null = null
+  let bestTau = -1
+  let bestValue = Number.POSITIVE_INFINITY
+
+  for (let tau = minTau; tau <= maxTau; tau += 1) {
+    const value = cumulative[tau]
+    if (value < bestValue) {
+      bestValue = value
+      bestTau = tau
+    }
+
+    const isLocalMinimum =
+      tau > minTau &&
+      tau < maxTau &&
+      value <= cumulative[tau - 1] &&
+      value <= cumulative[tau + 1]
+    if (isLocalMinimum && value <= relaxedThreshold) {
+      addPitchCandidate(candidates, cumulative, tau, sampleRate)
+    }
+  }
+
+  for (let tau = minTau; tau <= maxTau; tau += 1) {
+    if (cumulative[tau] < threshold) {
+      let localTau = tau
+      while (
+        localTau + 1 <= maxTau &&
+        cumulative[localTau + 1] < cumulative[localTau]
+      ) {
+        localTau += 1
+      }
+      thresholdCandidate = addPitchCandidate(
+        candidates,
+        cumulative,
+        localTau,
+        sampleRate,
+      )
+      break
+    }
+  }
+
+  if (bestTau >= 0 && bestValue <= relaxedThreshold) {
+    addPitchCandidate(candidates, cumulative, bestTau, sampleRate)
+  }
+
+  const allCandidates = [...candidates.values()]
+  const sortedCandidates = allCandidates.sort(
+    (first, second) =>
+      pitchCandidateScore(first, options, allCandidates) -
+      pitchCandidateScore(second, options, allCandidates),
+  )
+  if (
+    (options.referenceMidi === null || options.referenceMidi === undefined) &&
+    thresholdCandidate
+  ) {
+    return [
+      thresholdCandidate,
+      ...sortedCandidates.filter((candidate) => candidate !== thresholdCandidate),
+    ]
+  }
+
+  return sortedCandidates
+}
+
+function addPitchCandidate(
+  candidates: Map<number, PitchEstimate>,
+  cumulative: Float32Array,
+  tau: number,
+  sampleRate: number,
+): PitchEstimate | null {
+  const refinedTau = parabolicTau(cumulative, tau)
+  const frequency = sampleRate / refinedTau
+  const midi = frequencyToMidi(frequency)
+  if (!Number.isFinite(midi)) {
+    return null
+  }
+
+  const roundedKey = Math.round(midi * 100) / 100
+  const yin = cumulative[tau]
+  const candidate = {
+    frequency,
+    midi,
+    yin,
+    confidence: Math.max(0, Math.min(1, 1 - yin)),
+  }
+  const previous = candidates.get(roundedKey)
+  if (!previous || candidate.yin < previous.yin) {
+    candidates.set(roundedKey, candidate)
+    return candidate
+  }
+
+  return previous
+}
+
+function pitchCandidateScore(
+  candidate: PitchEstimate,
+  options: PitchEstimateOptions,
+  candidates: PitchEstimate[],
+): number {
+  const referenceMidi = options.referenceMidi
+  const subharmonicIntervals = [12, 19, 24]
+  const subharmonicPenalty = candidates.some((other) => {
+    if (other.midi <= candidate.midi || other.yin > candidate.yin + 0.08) {
+      return false
+    }
+
+    return subharmonicIntervals.some(
+      (interval) => Math.abs(other.midi - candidate.midi - interval) <= 0.75,
+    )
+  })
+    ? 0.12
+    : 0
+  if (referenceMidi === null || referenceMidi === undefined) {
+    return candidate.yin + subharmonicPenalty
+  }
+
+  const distance = Math.abs(candidate.midi - referenceMidi)
+  const octaveLikeJump = Math.min(
+    Math.abs(distance - 12),
+    Math.abs(distance - 24),
+  )
+  const harmonicPenalty =
+    octaveLikeJump <= 0.75 && candidate.confidence <= (options.referenceConfidence ?? 0) + 0.08
+      ? 0.18
+      : 0
+  const largeDownwardDropPenalty =
+    candidate.midi < referenceMidi - 14 &&
+    candidate.confidence <= (options.referenceConfidence ?? 0) + 0.12
+      ? 0.16
+      : 0
+  const continuityPenalty = distance <= 2 ? distance * 0.012 : 0
+
+  return (
+    candidate.yin +
+    continuityPenalty +
+    harmonicPenalty +
+    largeDownwardDropPenalty +
+    subharmonicPenalty
+  )
+}
+
 function applyOnePoleLowPass(
   samples: Float32Array,
   sampleRate: number,
@@ -1088,6 +1553,33 @@ function rms(samples: Float32Array): number {
     sum += samples[index] * samples[index]
   }
   return Math.sqrt(sum / Math.max(1, samples.length))
+}
+
+function sortedPositiveRms(frames: LivePitchFrame[]): number[] {
+  return frames
+    .map((frame) => frame.rms)
+    .filter((value) => value > 0)
+    .sort((a, b) => a - b)
+}
+
+function percentile(sortedValues: number[], percentileValue: number): number {
+  if (sortedValues.length === 0) {
+    return 0
+  }
+
+  const index = Math.min(
+    sortedValues.length - 1,
+    Math.max(0, Math.floor(sortedValues.length * percentileValue)),
+  )
+  return sortedValues[index] ?? 0
+}
+
+function average(values: number[]): number {
+  if (values.length === 0) {
+    return 0
+  }
+
+  return values.reduce((sum, value) => sum + value, 0) / values.length
 }
 
 function frequencyToMidi(frequency: number): number {

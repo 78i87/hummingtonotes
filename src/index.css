@@ -229,9 +229,9 @@ h2 {
   gap: 18px;
   min-height: 380px;
   padding: 18px;
-  border: 1px solid #d3dbd5;
+  border: 1px solid #2f3934;
   border-radius: 8px;
-  background: #f3f6f2;
+  background: #2a2d2b;
 }
 
 .key-wheel-svg {
@@ -242,47 +242,74 @@ h2 {
 }
 
 .wheel-segment {
-  fill: #202622;
-  stroke: #303732;
+  stroke: #2f312f;
   stroke-width: 1.5;
+  transition:
+    opacity 80ms linear,
+    filter 80ms linear;
 }
 
-.wheel-segment.active {
-  fill: #ff687d;
-  filter: drop-shadow(0 10px 16px rgba(255, 104, 125, 0.3));
+.wheel-segment.visible-note {
+  fill: #141716;
+}
+
+.wheel-segment.muted-note {
+  fill: #252927;
+  opacity: 0.34;
+}
+
+.wheel-segment.current {
+  fill: #ff6a7d;
+  opacity: 1;
+  filter: drop-shadow(0 13px 16px rgba(255, 93, 120, 0.24));
 }
 
 .wheel-label {
-  fill: #eef4ee;
+  fill: #101211;
   font-size: 16px;
   font-weight: 900;
   pointer-events: none;
 }
 
-.wheel-label.active {
-  fill: #fff;
+.wheel-label.visible-note {
+  fill: #f2f2ed;
+}
+
+.wheel-label.muted-note {
+  fill: #4b514e;
+  opacity: 0.26;
+}
+
+.wheel-label.current {
+  fill: #fff8f5;
   font-size: 18px;
 }
 
-.wheel-inner-ring {
-  fill: #1b201d;
-  stroke: #2b322e;
-  stroke-width: 14;
-}
-
-.wheel-core {
-  fill: #111816;
-  stroke: #202622;
-  stroke-width: 5;
-}
-
 .wheel-ray {
-  stroke: #ff8192;
+  stroke: #ff7d8f;
   stroke-linecap: round;
-  filter: drop-shadow(0 4px 12px rgba(255, 104, 125, 0.35));
+  filter: drop-shadow(0 5px 11px rgba(255, 93, 120, 0.34));
   transition:
     opacity 80ms linear,
     stroke-width 80ms linear;
+}
+
+.wheel-inner-ring {
+  fill: #252827;
+  stroke: #2b2e2c;
+  stroke-width: 16;
+}
+
+.wheel-inner-shadow {
+  fill: #1f2221;
+  stroke: #232625;
+  stroke-width: 7;
+}
+
+.wheel-core {
+  fill: #111312;
+  stroke: #202321;
+  stroke-width: 5;
 }
 
 .wheel-center-note {
@@ -413,6 +440,14 @@ h2 {
   grid-template-columns: 1fr 1fr;
   gap: 8px;
   margin-bottom: 12px;
+}
+
+.calibration-message {
+  margin: -2px 0 10px;
+  color: #52635b;
+  font-size: 0.8rem;
+  font-weight: 800;
+  line-height: 1.35;
 }
 
 .meter-list {

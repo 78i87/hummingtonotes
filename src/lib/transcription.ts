@@ -9,20 +9,33 @@ import { resampleToBasicPitchInput } from './audio'
 import type { DetectedNote, RawTranscription } from './types'
 
 const MODEL_URL = '/basic-pitch/model.json'
-const ONSET_THRESHOLD = 0.25
-const FRAME_THRESHOLD = 0.25
-const MIN_NOTE_LENGTH_FRAMES = 5
+const DEFAULT_BASIC_PITCH_OPTIONS = {
+  onsetThreshold: 0.32,
+  frameThreshold: 0.22,
+  minNoteLengthFrames: 6,
+} satisfies BasicPitchTranscriptionOptions
 
 let basicPitch: BasicPitch | undefined
+
+export interface BasicPitchTranscriptionOptions {
+  onsetThreshold?: number
+  frameThreshold?: number
+  minNoteLengthFrames?: number
+}
 
 export async function transcribeWithBasicPitch(
   audioBuffer: AudioBuffer,
   onProgress: (progress: number) => void,
+  options: BasicPitchTranscriptionOptions = {},
 ): Promise<RawTranscription> {
   const samples = await resampleToBasicPitchInput(audioBuffer)
   const frames: number[][] = []
   const onsets: number[][] = []
   const contours: number[][] = []
+  const resolvedOptions = {
+    ...DEFAULT_BASIC_PITCH_OPTIONS,
+    ...options,
+  }
 
   await getBasicPitch().evaluateModel(
     samples,
@@ -40,9 +53,9 @@ export async function transcribeWithBasicPitch(
       outputToNotesPoly(
         frames,
         onsets,
-        ONSET_THRESHOLD,
-        FRAME_THRESHOLD,
-        MIN_NOTE_LENGTH_FRAMES,
+        resolvedOptions.onsetThreshold,
+        resolvedOptions.frameThreshold,
+        resolvedOptions.minNoteLengthFrames,
       ),
     ),
   )

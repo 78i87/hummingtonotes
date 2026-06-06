@@ -10,17 +10,21 @@ import {
 } from 'lucide-react'
 import type { ReactNode } from 'react'
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { Note, Scale } from 'tonal'
 
 import { decodeBlobToAudioSource } from './lib/audio'
+import { liveKeyWheelNotes } from './lib/keyWheel'
 import {
   LIVE_FRAME_SIZE,
   analyzeLiveFrame,
+  calibrateSilenceFromFrames,
+  calibrateVoiceFromFrames,
   classifyTrigger,
   cleanupCapturedClip,
   createLiveEngineState,
+  effectiveInputThreshold,
   extractTriggerFeature,
   mergeClipWithBasicPitch,
+  scaledRmsThreshold,
   type LiveEngineState,
 } from './lib/liveEngine'
 import { createPerformanceMidiBlob } from './lib/midi'
@@ -71,6 +75,7 @@ function App() {
   const [progress, setProgress] = useState(0)
   const [tempo, setTempo] = useState(120)
   const [error, setError] = useState('')
+  const [calibrationMessage, setCalibrationMessage] = useState('')
   const [isPlayingClip, setIsPlayingClip] = useState(false)
 
   const profileRef = useRef(profile)
@@ -301,6 +306,8 @@ function App() {
         midi: activeMidi,
       })
       engineStateRef.current.activeMidi = null
+      engineStateRef.current.activePeakRms = 0
+      engineStateRef.current.activeLowEnergyFrames = 0
     }
 
     isCapturingRef.current = false
@@ -392,7 +399,9 @@ function App() {
       events.push(triggerEvent)
     }
 
-    playLiveEvents(events)
+    if (!isCapturingRef.current) {
+      playLiveEvents(events)
+    }
     recordLiveData(result.frame, events)
 
     liveFrameCounterRef.current += 1
@@ -428,8 +437,12 @@ function App() {
       return null
     }
 
+    const triggerThreshold = scaledRmsThreshold(
+      profileRef.current.calibration,
+      profileRef.current.pitch.inputLevel,
+    )
     if (
-      frame.rms < profileRef.current.calibration.rmsThreshold * 1.75 ||
+      frame.rms < triggerThreshold * 1.75 ||
       frame.time - lastTriggerAtRef.current < 0.12
     ) {
       return null
@@ -458,15 +471,21 @@ function App() {
     }
 
     setStatus('calibrating')
-    const floor = average(recentFrames.slice(-40).map((frame) => frame.rms))
-    updateProfile((current) => ({
-      ...current,
-      calibration: {
-        ...current.calibration,
-        noiseFloorRms: floor,
-        rmsThreshold: Math.max(floor * 3.2, 0.01),
-      },
-    }))
+    const frames = recentFrames.slice(-40)
+    const calibration = calibrateSilenceFromFrames(
+      profileRef.current.calibration,
+      frames,
+      profileRef.current.pitch.inputLevel,
+    )
+    if (!calibration) {
+      setCalibrationMessage('Silence calibration needs a few more frames.')
+    } else {
+      setCalibrationMessage('Silence floor captured.')
+      updateProfile((current) => ({
+        ...current,
+        calibration,
+      }))
+    }
     window.setTimeout(() => setStatus(audioContextRef.current ? 'monitoring' : 'idle'), 180)
   }
 
@@ -476,23 +495,19 @@ function App() {
     }
 
     setStatus('calibrating')
-    const voiced = recentFrames
-      .slice(-90)
-      .filter((frame) => frame.estimatedMidi !== null && frame.rms > 0.01)
-    const rmsValues = voiced.map((frame) => frame.rms)
-    const midiValues = voiced
-      .map((frame) => frame.estimatedMidi)
-      .filter((midi): midi is number => midi !== null)
-    if (rmsValues.length > 0 && midiValues.length > 0) {
+    const frames = recentFrames.slice(-90)
+    const update = calibrateVoiceFromFrames(
+      profileRef.current.calibration,
+      frames,
+      profileRef.current.pitch.inputLevel,
+    )
+    if (!update) {
+      setCalibrationMessage('Voice calibration needs a louder or longer hold.')
+    } else {
+      setCalibrationMessage(calibrationFeedbackLabel(update.feedback))
       updateProfile((current) => ({
         ...current,
-        calibration: {
-          ...current.calibration,
-          vocalRms: Math.max(average(rmsValues), current.calibration.noiseFloorRms * 6),
-          rmsThreshold: Math.max(current.calibration.noiseFloorRms * 3.2, average(rmsValues) * 0.2),
-          minMidi: Math.floor(Math.min(...midiValues) - 12),
-          maxMidi: Math.ceil(Math.max(...midiValues) + 12),
-        },
+        calibration: update.calibration,
       }))
     }
     window.setTimeout(() => setStatus(audioContextRef.current ? 'monitoring' : 'idle'), 180)
@@ -790,10 +805,14 @@ function App() {
             cents={latestCents}
             confidence={latestFrame?.confidence ?? 0}
             rms={latestFrame?.rms ?? 0}
-            threshold={profile.calibration.rmsThreshold}
+            threshold={effectiveInputThreshold(
+              profile.calibration,
+              profile.pitch.inputLevel,
+            )}
             voiced={latestFrame?.voiced ?? false}
             keyName={profile.pitch.key}
             scaleName={profile.pitch.scale}
+            keyLock={profile.pitch.keyLock}
             lockedMidi={latestFrame?.lockedMidi ?? null}
           />
           <div className="mode-readout">
@@ -838,6 +857,9 @@ function App() {
               Calibrate voice
             </button>
           </div>
+          {calibrationMessage ? (
+            <p className="calibration-message">{calibrationMessage}</p>
+          ) : null}
           <div className="meter-list">
             <Meter label="Noise" value={profile.calibration.noiseFloorRms} max={0.2} />
             <Meter label="Voice" value={profile.calibration.vocalRms} max={0.4} />
@@ -1050,6 +1072,7 @@ interface KeyConfidenceWheelProps {
   voiced: boolean
   keyName: KeyName
   scaleName: ScaleName
+  keyLock: boolean
   lockedMidi: number | null
 }
 
@@ -1062,9 +1085,10 @@ function KeyConfidenceWheel({
   voiced,
   keyName,
   scaleName,
+  keyLock,
   lockedMidi,
 }: KeyConfidenceWheelProps) {
-  const wheelNotes = keyWheelNotes(keyName, scaleName)
+  const wheelNotes = liveKeyWheelNotes(keyName, scaleName, keyLock)
   const activeChroma =
     lockedMidi === null ? null : ((Math.round(lockedMidi) % 12) + 12) % 12
   const activeIndex = wheelNotes.findIndex((wheelNote) => wheelNote.chroma === activeChroma)
@@ -1073,9 +1097,9 @@ function KeyConfidenceWheel({
   const segmentAngle = 360 / wheelNotes.length
   const activeAngle =
     activeIndex >= 0
-      ? activeIndex * segmentAngle + segmentAngle / 2 - 90 + clamp(cents / 50, -0.42, 0.42) * segmentAngle
+      ? activeIndex * segmentAngle - 90 + clamp(cents / 50, -0.42, 0.42) * segmentAngle
       : -90
-  const rayEnd = polarPoint(150, 150, 64 + strength * 62, activeAngle)
+  const rayEnd = polarPoint(150, 150, 62 + strength * 60, activeAngle)
   const displayNote = stripOctave(note)
 
   return (
@@ -1086,23 +1110,38 @@ function KeyConfidenceWheel({
         </title>
         {wheelNotes.map((wheelNote, index) => {
           const isActive = index === activeIndex && voiced
-          const startAngle = index * segmentAngle - 90 + 1.2
-          const endAngle = (index + 1) * segmentAngle - 90 - 1.2
-          const outerRadius = 106 + (isActive ? strength * 34 : 0)
+          const isVisible = wheelNote.visible
+          const startAngle = index * segmentAngle - 105 + 1.1
+          const endAngle = (index + 1) * segmentAngle - 105 - 1.1
+          const labelAngle = startAngle + segmentAngle / 2
+          const outerRadius = 106 + (isActive ? strength * 30 : 0)
+          const labelRadius = isActive ? 96 + strength * 5 : 94
 
           return (
             <g key={wheelNote.label}>
               <path
-                className={isActive ? 'wheel-segment active' : 'wheel-segment'}
-                d={ringSegmentPath(150, 150, 74, outerRadius, startAngle, endAngle)}
+                className={[
+                  'wheel-segment',
+                  isVisible ? 'visible-note' : 'muted-note',
+                  isActive ? 'current' : '',
+                ]
+                  .filter(Boolean)
+                  .join(' ')}
+                d={ringSegmentPath(150, 150, 72, outerRadius, startAngle, endAngle)}
                 style={{
-                  opacity: isActive ? 0.66 + strength * 0.34 : 1,
+                  opacity: isActive ? 0.78 + strength * 0.22 : isVisible ? 1 : 0.34,
                 }}
               />
               <text
-                className={isActive ? 'wheel-label active' : 'wheel-label'}
-                x={polarPoint(150, 150, 126, startAngle + segmentAngle / 2).x}
-                y={polarPoint(150, 150, 126, startAngle + segmentAngle / 2).y}
+                className={[
+                  'wheel-label',
+                  isVisible ? 'visible-note' : 'muted-note',
+                  isActive ? 'current' : '',
+                ]
+                  .filter(Boolean)
+                  .join(' ')}
+                x={polarPoint(150, 150, labelRadius, labelAngle).x}
+                y={polarPoint(150, 150, labelRadius, labelAngle).y}
                 textAnchor="middle"
                 dominantBaseline="middle"
               >
@@ -1111,9 +1150,7 @@ function KeyConfidenceWheel({
             </g>
           )
         })}
-        <circle className="wheel-inner-ring" cx="150" cy="150" r="68" />
-        <circle className="wheel-core" cx="150" cy="150" r="31" />
-        {voiced ? (
+        {voiced && activeIndex >= 0 ? (
           <line
             className="wheel-ray"
             x1="150"
@@ -1121,11 +1158,14 @@ function KeyConfidenceWheel({
             x2={rayEnd.x}
             y2={rayEnd.y}
             style={{
-              strokeWidth: 8 + strength * 18,
-              opacity: 0.38 + strength * 0.5,
+              strokeWidth: 8 + strength * 17,
+              opacity: 0.22 + strength * 0.46,
             }}
           />
         ) : null}
+        <circle className="wheel-inner-ring" cx="150" cy="150" r="68" />
+        <circle className="wheel-inner-shadow" cx="150" cy="150" r="48" />
+        <circle className="wheel-core" cx="150" cy="150" r="31" />
         <text className="wheel-center-note" x="150" y="145" textAnchor="middle">
           {displayNote}
         </text>
@@ -1431,14 +1471,6 @@ function preferredMimeType(): string {
   )
 }
 
-function average(values: number[]): number {
-  if (values.length === 0) {
-    return 0
-  }
-
-  return values.reduce((sum, value) => sum + value, 0) / values.length
-}
-
 function titleCase(value: string): string {
   return value.replace(/\b\w/g, (letter) => letter.toUpperCase())
 }
@@ -1458,32 +1490,25 @@ function statusLabel(status: ControllerStatus): string {
   }
 }
 
+function calibrationFeedbackLabel(
+  feedback: 'tooQuiet' | 'stableVoiceCaptured' | 'pitchRangeUnchanged',
+): string {
+  switch (feedback) {
+    case 'tooQuiet':
+      return 'Voice detected, but it is still quiet. Raise Input level if notes drop out.'
+    case 'stableVoiceCaptured':
+      return 'Stable voice captured.'
+    case 'pitchRangeUnchanged':
+      return 'Voice level captured. Pitch range unchanged.'
+  }
+}
+
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : 'Something went wrong.'
 }
 
 function midiToFrequency(midi: number): number {
   return 440 * 2 ** ((midi - 69) / 12)
-}
-
-function keyWheelNotes(keyName: KeyName, scaleName: ScaleName) {
-  const notes = Scale.get(`${keyName} ${scaleName}`).notes
-  if (notes.length > 0) {
-    return notes
-      .map((note) => ({
-        label: note,
-        chroma: Note.get(note).chroma,
-      }))
-      .filter((note): note is { label: string; chroma: number } => note.chroma !== undefined)
-  }
-
-  return [
-    { label: keyName, chroma: Note.get(keyName).chroma ?? 0 },
-    { label: 'V', chroma: (Note.get(keyName).chroma ?? 0) + 7 },
-  ].map((note) => ({
-    ...note,
-    chroma: ((note.chroma % 12) + 12) % 12,
-  }))
 }
 
 function ringSegmentPath(

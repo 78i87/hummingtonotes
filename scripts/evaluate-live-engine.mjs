@@ -1,17 +1,24 @@
 import { spawnSync } from 'node:child_process'
-import { existsSync, readdirSync, readFileSync } from 'node:fs'
+import {
+  existsSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+} from 'node:fs'
+import { tmpdir } from 'node:os'
 import path from 'node:path'
 import { performance } from 'node:perf_hooks'
+import { fileURLToPath, pathToFileURL } from 'node:url'
+
+import { build } from 'vite'
 
 const SAMPLE_RATE = 16_000
 const FRAME_SIZE = 1024
 const HOP_SIZE = 256
-const MIN_HZ = 90
-const MAX_HZ = 950
-const YIN_THRESHOLD = 0.18
-const NOTE_SWITCH_SECONDS = 0.08
-const MIN_NOTE_SECONDS = 0.06
 
+const scriptDir = path.dirname(fileURLToPath(import.meta.url))
+const projectRoot = path.resolve(scriptDir, '..')
 const datasetDir = process.argv.slice(2).find((arg) => !arg.startsWith('--'))
 const debugFile = process.argv
   .find((arg) => arg.startsWith('--file='))
@@ -32,6 +39,7 @@ if (files.length === 0) {
   throw new Error(`No label JSON files found in ${datasetDir}`)
 }
 
+const engine = await loadLiveEngine()
 const startedAt = performance.now()
 let totalDuration = 0
 let totalDecodeMs = 0
@@ -41,6 +49,8 @@ let totalPredicted = 0
 let totalCorrect = 0
 let totalPitchCorrect = 0
 let totalTimingCorrect = 0
+let totalOctaveErrors = 0
+let totalSplitNotes = 0
 const worstFiles = []
 
 for (const jsonFile of files) {
@@ -53,9 +63,14 @@ for (const jsonFile of files) {
   const decodeMs = performance.now() - decodeStartedAt
 
   const detectStartedAt = performance.now()
-  const predicted = detectLiveEngineNotes(samples, SAMPLE_RATE)
+  const profile = createBenchmarkProfile(
+    autoCalibrationFromSamples(samples, engine.createDefaultCalibration()),
+  )
+  const clip = engine.analyzeOfflineLiveClip(samples, SAMPLE_RATE, profile)
+  const predicted = clip.cleanedNotes
   const detectMs = performance.now() - detectStartedAt
   const score = scoreNotes(label.notes, predicted)
+  const splitNotes = splitNoteCount(label.notes, predicted)
   const duration = label.durationSeconds ?? samples.length / SAMPLE_RATE
 
   totalDuration += duration
@@ -66,12 +81,16 @@ for (const jsonFile of files) {
   totalCorrect += score.correct
   totalPitchCorrect += score.pitchCorrect
   totalTimingCorrect += score.timingCorrect
+  totalOctaveErrors += score.octaveErrors
+  totalSplitNotes += splitNotes
   worstFiles.push({
     file: jsonFile,
     gt: label.notes.length,
     predicted: predicted.length,
     accuracy: score.accuracy,
     falseNotes: Math.max(0, predicted.length - score.correct),
+    octaveErrors: score.octaveErrors,
+    splitNotes,
   })
 
   if (debugFile) {
@@ -80,9 +99,14 @@ for (const jsonFile of files) {
         {
           file: jsonFile,
           audioPath,
+          calibration: profile.calibration,
           groundTruth: label.notes.map(compactNote),
           predicted: predicted.map(compactNote),
-          score,
+          suggestedKey: clip.suggestedKey,
+          score: {
+            ...score,
+            splitNotes,
+          },
         },
         null,
         2,
@@ -109,13 +133,21 @@ console.log(
       pitchRecall: percent(totalPitchCorrect / Math.max(totalTruth, 1)),
       timingRecall: percent(totalTimingCorrect / Math.max(totalTruth, 1)),
       falseNotes: Math.max(0, totalPredicted - totalCorrect),
+      octaveErrors: totalOctaveErrors,
+      splitNotes: totalSplitNotes,
+      splitNoteRate: percent(totalSplitNotes / Math.max(totalTruth, 1)),
       detectSeconds: round(totalDetectMs / 1000),
       decodeSeconds: round(totalDecodeMs / 1000),
       wallSeconds: round(elapsedMs / 1000),
       detectRealtimeRatio: round(totalDetectMs / 1000 / totalDuration),
       totalRealtimeRatio: round((totalDecodeMs + totalDetectMs) / 1000 / totalDuration),
       worstFiles: worstFiles
-        .sort((a, b) => a.accuracy - b.accuracy)
+        .sort(
+          (a, b) =>
+            a.accuracy - b.accuracy ||
+            b.falseNotes - a.falseNotes ||
+            b.octaveErrors - a.octaveErrors,
+        )
         .slice(0, 12)
         .map((file) => ({ ...file, accuracy: percent(file.accuracy) })),
     },
@@ -124,147 +156,95 @@ console.log(
   ),
 )
 
-function detectLiveEngineNotes(samples, sampleRate) {
-  const threshold = adaptiveRmsThreshold(samples)
-  const state = {
-    activeMidi: null,
-    activeStart: 0,
-    activeFrames: [],
-    pendingMidi: null,
-    pendingStart: 0,
-  }
-  const notes = []
+async function loadLiveEngine() {
+  const bundleDir = mkdtempSync(path.join(tmpdir(), 'music-copilot-live-engine-'))
+  try {
+    await build({
+      root: projectRoot,
+      configFile: false,
+      logLevel: 'silent',
+      build: {
+        emptyOutDir: true,
+        outDir: bundleDir,
+        target: 'node24',
+        lib: {
+          entry: path.join(projectRoot, 'src/lib/liveEngine.ts'),
+          formats: ['es'],
+          fileName: 'live-engine',
+        },
+      },
+    })
+    const bundleFile = readdirSync(bundleDir).find((file) => file.endsWith('.mjs') || file.endsWith('.js'))
+    if (!bundleFile) {
+      throw new Error(`Vite did not write a live engine bundle to ${bundleDir}`)
+    }
 
+    return await import(pathToFileURL(path.join(bundleDir, bundleFile)).href)
+  } finally {
+    process.once('exit', () => {
+      rmSync(bundleDir, { force: true, recursive: true })
+    })
+  }
+}
+
+function createBenchmarkProfile(calibration) {
+  return {
+    id: 'benchmark',
+    name: 'Benchmark Voice',
+    updatedAt: Date.now(),
+    calibration,
+    pitch: {
+      key: 'C',
+      scale: 'major',
+      keyLock: false,
+      bendMode: 'intellibend',
+      inputLevel: 1,
+      stickiness: 0.6,
+      transpose: 0,
+      octave: 0,
+    },
+    chords: {
+      enabled: false,
+      preset: 'majorTriad',
+      voicing: 'cluster',
+      holdSeconds: 0.6,
+    },
+    triggers: [],
+    ccMappings: [],
+    ccSmoothing: 0.7,
+  }
+}
+
+function autoCalibrationFromSamples(samples, fallback) {
+  const frameRms = []
   for (
     let startSample = 0;
     startSample + FRAME_SIZE <= samples.length;
     startSample += HOP_SIZE
   ) {
-    const frame = samples.subarray(startSample, startSample + FRAME_SIZE)
-    const time = startSample / sampleRate
-    const rmsValue = rms(frame)
-    const estimate =
-      rmsValue >= threshold.rms
-        ? estimatePitchYin(frame, sampleRate, threshold.yin)
-        : null
-    const lockedMidi = estimate ? Math.round(frequencyToMidi(estimate.frequency)) : null
-
-    if (lockedMidi === null) {
-      closeActiveNote(notes, state, time)
-      continue
-    }
-
-    if (state.activeMidi === null) {
-      state.activeMidi = lockedMidi
-      state.activeStart = time
-      state.activeFrames = [{ midi: frequencyToMidi(estimate.frequency), rms: rmsValue }]
-      continue
-    }
-
-    if (lockedMidi === state.activeMidi) {
-      state.pendingMidi = null
-      state.activeFrames.push({ midi: frequencyToMidi(estimate.frequency), rms: rmsValue })
-      continue
-    }
-
-    if (state.pendingMidi !== lockedMidi) {
-      state.pendingMidi = lockedMidi
-      state.pendingStart = time
-      continue
-    }
-
-    if (time - state.pendingStart >= NOTE_SWITCH_SECONDS) {
-      closeActiveNote(notes, state, time)
-      state.activeMidi = lockedMidi
-      state.activeStart = time
-      state.activeFrames = [{ midi: frequencyToMidi(estimate.frequency), rms: rmsValue }]
-      state.pendingMidi = null
-    }
+    frameRms.push(rms(samples.subarray(startSample, startSample + FRAME_SIZE)))
   }
 
-  closeActiveNote(notes, state, samples.length / sampleRate)
-  return notes.map((note, index) => ({ ...note, id: `live-${index}` }))
-}
-
-function closeActiveNote(notes, state, time) {
-  if (state.activeMidi === null) {
-    return
-  }
-
-  const duration = time - state.activeStart
-  if (duration >= MIN_NOTE_SECONDS) {
-    const weight = state.activeFrames.reduce((sum, frame) => sum + frame.rms, 0)
-    const midi =
-      state.activeFrames.reduce((sum, frame) => sum + frame.midi * frame.rms, 0) /
-      Math.max(1e-6, weight)
-    notes.push({
-      start: state.activeStart,
-      duration,
-      midi,
-      velocity: Math.max(0.1, Math.min(1, Math.max(...state.activeFrames.map((frame) => frame.rms)) * 8)),
-      pitchBends: [],
-      confidence: 0.85,
-    })
-  }
-
-  state.activeMidi = null
-  state.pendingMidi = null
-  state.activeFrames = []
-}
-
-function estimatePitchYin(samples, sampleRate, threshold) {
-  const minTau = Math.max(2, Math.floor(sampleRate / MAX_HZ))
-  const maxTau = Math.min(samples.length - 2, Math.ceil(sampleRate / MIN_HZ))
-  const difference = new Float64Array(maxTau + 1)
-
-  for (let tau = minTau; tau <= maxTau; tau += 1) {
-    let sum = 0
-    for (let index = 0; index + tau < samples.length; index += 1) {
-      const delta = samples[index] - samples[index + tau]
-      sum += delta * delta
-    }
-    difference[tau] = sum
-  }
-
-  let runningTotal = 0
-  const cumulative = new Float64Array(maxTau + 1)
-  for (let tau = 1; tau <= maxTau; tau += 1) {
-    runningTotal += difference[tau]
-    cumulative[tau] = runningTotal > 0 ? (difference[tau] * tau) / runningTotal : 1
-  }
-
-  let bestTau = -1
-  for (let tau = minTau; tau <= maxTau; tau += 1) {
-    if (cumulative[tau] < threshold) {
-      bestTau = tau
-      while (bestTau + 1 <= maxTau && cumulative[bestTau + 1] < cumulative[bestTau]) {
-        bestTau += 1
-      }
-      break
-    }
-  }
-
-  if (bestTau < 0) {
-    return null
-  }
-
-  return { frequency: sampleRate / parabolicTau(cumulative, bestTau) }
-}
-
-function adaptiveRmsThreshold(samples) {
-  const values = []
-  for (let start = 0; start + FRAME_SIZE <= samples.length; start += HOP_SIZE) {
-    values.push(rms(samples.subarray(start, start + FRAME_SIZE)))
-  }
-  const sorted = values.filter((value) => value > 0).sort((a, b) => a - b)
+  const sorted = frameRms.filter((value) => value > 0).sort((a, b) => a - b)
   if (sorted.length === 0) {
-    return { rms: 1, yin: YIN_THRESHOLD }
+    return fallback
   }
-  const low = percentile(sorted, 0.2)
-  const mid = percentile(sorted, 0.5)
+
+  const noiseFloorRms = Math.max(0.001, percentile(sorted, 0.15))
+  const vocalRms = Math.max(
+    percentile(sorted, 0.8),
+    average(sorted),
+    noiseFloorRms * 6,
+  )
+
   return {
-    rms: Math.max(0.002, Math.min(low * 3.2, mid * 0.45)),
-    yin: YIN_THRESHOLD,
+    ...fallback,
+    inputLevel: 1,
+    noiseFloorRms,
+    vocalRms,
+    rmsThreshold: Math.max(noiseFloorRms * 2.4, vocalRms * 0.12, 0.008),
+    minMidi: 36,
+    maxMidi: 88,
   }
 }
 
@@ -273,6 +253,7 @@ function scoreNotes(groundTruth, predicted) {
   let correct = 0
   let pitchCorrect = 0
   let timingCorrect = 0
+  let octaveErrors = 0
 
   for (const truth of groundTruth) {
     let bestIndex = -1
@@ -294,13 +275,18 @@ function scoreNotes(groundTruth, predicted) {
 
     const match = predicted[bestIndex]
     used.add(bestIndex)
-    const pitchMatches = Math.round(match.midi) === Math.round(truth.midi)
+    const truthMidi = Math.round(truth.actualMidi ?? truth.midi)
+    const predictedMidi = Math.round(match.midi)
+    const pitchMatches = predictedMidi === truthMidi
     const timingMatches =
       bestOverlap / Math.max(0.001, truth.duration) >= 0.5 ||
       Math.abs(match.start - truth.start) <= 0.08
+    const pitchDistance = Math.abs(predictedMidi - truthMidi)
 
     if (pitchMatches) {
       pitchCorrect += 1
+    } else if (Math.abs(pitchDistance - 12) <= 1) {
+      octaveErrors += 1
     }
     if (timingMatches) {
       timingCorrect += 1
@@ -314,8 +300,23 @@ function scoreNotes(groundTruth, predicted) {
     correct,
     pitchCorrect,
     timingCorrect,
+    octaveErrors,
     accuracy: correct / Math.max(groundTruth.length, predicted.length, 1),
   }
+}
+
+function splitNoteCount(groundTruth, predicted) {
+  return groundTruth.reduce((sum, truth) => {
+    const truthMidi = Math.round(truth.actualMidi ?? truth.midi)
+    const overlaps = predicted.filter((note) => {
+      const overlap = overlapSeconds(truth, note)
+      return (
+        Math.round(note.midi) === truthMidi &&
+        overlap / Math.max(0.001, truth.duration) >= 0.15
+      )
+    })
+    return sum + Math.max(0, overlaps.length - 1)
+  }, 0)
 }
 
 function audioPathForLabel(jsonPath) {
@@ -365,21 +366,6 @@ function overlapSeconds(first, second) {
   return Math.max(0, end - start)
 }
 
-function frequencyToMidi(frequency) {
-  return 69 + 12 * Math.log2(frequency / 440)
-}
-
-function parabolicTau(values, tau) {
-  if (tau <= 0 || tau >= values.length - 1) {
-    return tau
-  }
-  const left = values[tau - 1]
-  const center = values[tau]
-  const right = values[tau + 1]
-  const denominator = left - 2 * center + right
-  return Math.abs(denominator) < 1e-9 ? tau : tau + (left - right) / (2 * denominator)
-}
-
 function rms(samples) {
   let sum = 0
   for (let index = 0; index < samples.length; index += 1) {
@@ -393,14 +379,22 @@ function percentile(sorted, percentileValue) {
     sorted.length - 1,
     Math.max(0, Math.floor(sorted.length * percentileValue)),
   )
-  return sorted[index]
+  return sorted[index] ?? 0
+}
+
+function average(values) {
+  if (values.length === 0) {
+    return 0
+  }
+
+  return values.reduce((sum, value) => sum + value, 0) / values.length
 }
 
 function compactNote(note) {
   return {
     start: round(note.start),
     duration: round(note.duration),
-    midi: round(note.midi),
+    midi: round(note.actualMidi ?? note.midi),
   }
 }
 

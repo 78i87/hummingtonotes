@@ -1,12 +1,16 @@
 import { describe, expect, it } from 'vitest'
 
 import {
+  analyzeLiveFrame,
+  calibrateVoiceFromFrames,
   chordNotesForRoot,
   cleanupCapturedClip,
   classifyTrigger,
   createLiveEngineState,
   estimatePitchYin,
+  effectiveInputThreshold,
   extractTriggerFeature,
+  inferKeyFromPerformance,
   mergeClipWithBasicPitch,
   noteEventsForFrame,
   smoothCcEvents,
@@ -24,6 +28,104 @@ describe('live vocal engine', () => {
     expect(estimate?.midi).toBeCloseTo(69, 0)
   })
 
+  it('uses continuity to prefer the fundamental in harmonic-rich input', () => {
+    const sampleRate = 16000
+    const samples = harmonicRichSine(220, sampleRate, 1024)
+    const estimate = estimatePitchYin(samples, sampleRate, 0.18, {
+      referenceMidi: 57,
+      referenceConfidence: 0.93,
+    })
+
+    expect(estimate?.midi).toBeCloseTo(57, 0)
+  })
+
+  it('does not pin large non-octave interval jumps to the previous note', () => {
+    const sampleRate = 16000
+    const samples = sine(392, sampleRate, 1024)
+    const estimate = estimatePitchYin(samples, sampleRate, 0.18, {
+      referenceMidi: 60,
+      referenceConfidence: 0.93,
+    })
+
+    expect(estimate?.midi).toBeCloseTo(67, 0)
+  })
+
+  it('accepts quiet high-confidence pitch above the adaptive input floor', () => {
+    const profile = {
+      ...createDefaultProfile(),
+      calibration: {
+        ...createDefaultProfile().calibration,
+        noiseFloorRms: 0.004,
+        vocalRms: 0.08,
+        rmsThreshold: 0.03,
+      },
+    }
+    const result = analyzeLiveFrame(
+      sine(440, 16000, 1024, 0.025),
+      16000,
+      0,
+      profile,
+      createLiveEngineState(),
+    )
+
+    expect(result.frame.rms).toBeLessThan(profile.calibration.rmsThreshold)
+    expect(result.frame.voiced).toBe(true)
+    expect(result.frame.lockedMidi).toBe(69)
+  })
+
+  it('rejects input below the adaptive input floor', () => {
+    const profile = createDefaultProfile()
+    const result = analyzeLiveFrame(
+      sine(440, 16000, 1024, 0.002),
+      16000,
+      0,
+      profile,
+      createLiveEngineState(),
+    )
+
+    expect(result.frame.voiced).toBe(false)
+    expect(result.events.some((event) => event.type === 'noteOn')).toBe(false)
+  })
+
+  it('scales calibrated thresholds when input level changes', () => {
+    const calibration = {
+      ...createDefaultProfile().calibration,
+      inputLevel: 1,
+      noiseFloorRms: 0.006,
+      vocalRms: 0.1,
+      rmsThreshold: 0.03,
+    }
+
+    expect(effectiveInputThreshold(calibration, 2)).toBeCloseTo(
+      effectiveInputThreshold(calibration, 1) * 2,
+    )
+  })
+
+  it('updates voice RMS without changing pitch range when pitch is not stable', () => {
+    const calibration = {
+      ...createDefaultProfile().calibration,
+      noiseFloorRms: 0.004,
+      vocalRms: 0.04,
+      minMidi: 48,
+      maxMidi: 72,
+    }
+    const update = calibrateVoiceFromFrames(
+      calibration,
+      [
+        unvoicedFrame(0, 0.05),
+        unvoicedFrame(0.02, 0.055),
+        unvoicedFrame(0.04, 0.052),
+      ],
+      1.4,
+    )
+
+    expect(update?.calibration.vocalRms).toBeGreaterThan(calibration.vocalRms)
+    expect(update?.calibration.inputLevel).toBe(1.4)
+    expect(update?.calibration.minMidi).toBe(48)
+    expect(update?.calibration.maxMidi).toBe(72)
+    expect(update?.feedback).toBe('pitchRangeUnchanged')
+  })
+
   it('keeps IntelliBend anchored until a new note is stable', () => {
     const state = createLiveEngineState()
     const first = noteEventsForFrame(frame(0, 60, 0), 'intellibend', state)
@@ -33,6 +135,25 @@ describe('live vocal engine', () => {
     expect(first.some((event) => event.type === 'noteOn' && event.midi === 60)).toBe(true)
     expect(earlySwitch.some((event) => event.type === 'noteOn' && event.midi === 62)).toBe(false)
     expect(committedSwitch.some((event) => event.type === 'noteOn' && event.midi === 62)).toBe(true)
+  })
+
+  it('keeps an active note through one low-energy dip', () => {
+    const state = createLiveEngineState()
+    noteEventsForFrame(frameWithRms(0, 60, 0, 0.2), 'intellibend', state)
+    const dip = noteEventsForFrame(frameWithRms(0.08, 60, 0, 0.03), 'intellibend', state)
+
+    expect(dip.some((event) => event.type === 'noteOff')).toBe(false)
+    expect(state.activeMidi).toBe(60)
+  })
+
+  it('releases an active note after consecutive low-energy frames', () => {
+    const state = createLiveEngineState()
+    noteEventsForFrame(frameWithRms(0, 60, 0, 0.2), 'intellibend', state)
+    noteEventsForFrame(frameWithRms(0.08, 60, 0, 0.03), 'intellibend', state)
+    const release = noteEventsForFrame(frameWithRms(0.1, 60, 0, 0.03), 'intellibend', state)
+
+    expect(release.some((event) => event.type === 'noteOff' && event.midi === 60)).toBe(true)
+    expect(state.activeMidi).toBeNull()
   })
 
   it('uses pitch stickiness to reject shallow adjacent-note wobble', () => {
@@ -173,6 +294,67 @@ describe('live vocal engine', () => {
     expect(merged.cleanedNotes[0]?.pitchBends).toEqual([0.1])
   })
 
+  it('uses Basic Pitch boundaries when live frames support the note', () => {
+    const profile = createDefaultProfile()
+    const clip = clipWithLiveNotes(profile, [
+      adjustedNote('live-c', 0, 1, 60, 0.86, 0.85),
+    ])
+    const merged = mergeClipWithBasicPitch(
+      {
+        ...clip,
+        rawFrames: [frame(0.12, 60, 0), frame(0.3, 60, 0), frame(0.56, 60, 0)],
+      },
+      [detectedNote('basic-c', 0.1, 0.5, 60, 0.7, 0.78)],
+      profile,
+    )
+
+    expect(merged.cleanedNotes).toHaveLength(1)
+    expect(merged.cleanedNotes[0]?.midi).toBe(60)
+    expect(merged.cleanedNotes[0]?.start).toBeCloseTo(0.1)
+    expect(merged.cleanedNotes[0]?.duration).toBeCloseTo(0.5)
+  })
+
+  it('rejects unsupported low-confidence Basic Pitch artifacts', () => {
+    const profile = createDefaultProfile()
+    const clip = clipWithLiveNotes(profile, [
+      adjustedNote('live-c', 0, 0.7, 60, 0.86, 0.85),
+    ])
+    const merged = mergeClipWithBasicPitch(
+      {
+        ...clip,
+        rawFrames: [frame(0.1, 60, 0), frame(0.35, 60, 0), frame(0.6, 60, 0)],
+      },
+      [detectedNote('artifact', 0.2, 0.12, 84, 0.18, 0.2)],
+      profile,
+    )
+
+    expect(merged.cleanedNotes).toHaveLength(1)
+    expect(merged.cleanedNotes[0]?.midi).toBe(60)
+  })
+
+  it('keeps confident live-only notes when Basic Pitch misses them', () => {
+    const profile = createDefaultProfile()
+    const clip = clipWithLiveNotes(profile, [
+      adjustedNote('live-c', 0, 0.3, 60, 0.86, 0.85),
+      adjustedNote('live-e', 0.55, 0.35, 64, 0.84, 0.83),
+    ])
+    const merged = mergeClipWithBasicPitch(
+      {
+        ...clip,
+        rawFrames: [
+          frame(0.08, 60, 0),
+          frame(0.22, 60, 0),
+          frame(0.6, 64, 0),
+          frame(0.82, 64, 0),
+        ],
+      },
+      [detectedNote('basic-c', 0, 0.32, 60, 0.72, 0.82)],
+      profile,
+    )
+
+    expect(merged.cleanedNotes.map((note) => note.midi)).toEqual([60, 64])
+  })
+
   it('merges adjacent Basic Pitch fragments into one sustained note', () => {
     const profile = createDefaultProfile()
     const clip = cleanupCapturedClip({
@@ -236,6 +418,33 @@ describe('live vocal engine', () => {
     expect(merged.cleanedNotes).toHaveLength(1)
     expect(merged.cleanedNotes[0]?.midi).toBe(55)
   })
+
+  it('infers key from estimated frame pitch instead of scale-locked notes', () => {
+    const profile = {
+      ...createDefaultProfile(),
+      pitch: {
+        ...createDefaultProfile().pitch,
+        key: 'C' as const,
+        scale: 'major' as const,
+        keyLock: true,
+      },
+    }
+    const suggestion = inferKeyFromPerformance(
+      [],
+      [
+        frameWithEstimate(0, 62, 60, 0),
+        frameWithEstimate(0.02, 66, 60, 0),
+        frameWithEstimate(0.04, 69, 60, 0),
+        frameWithEstimate(0.06, 62, 60, 0),
+        frameWithEstimate(0.08, 66, 60, 0),
+        frameWithEstimate(0.1, 69, 60, 0),
+      ],
+      profile,
+    )
+
+    expect(suggestion.key).toBe('D')
+    expect(suggestion.scale).toBe('major')
+  })
 })
 
 function frame(time: number, lockedMidi: number, centsOffset: number): LivePitchFrame {
@@ -247,6 +456,18 @@ function frame(time: number, lockedMidi: number, centsOffset: number): LivePitch
     centsOffset,
     confidence: 0.9,
     voiced: true,
+  }
+}
+
+function frameWithRms(
+  time: number,
+  lockedMidi: number,
+  centsOffset: number,
+  frameRms: number,
+): LivePitchFrame {
+  return {
+    ...frame(time, lockedMidi, centsOffset),
+    rms: frameRms,
   }
 }
 
@@ -267,6 +488,18 @@ function frameWithEstimate(
   }
 }
 
+function unvoicedFrame(time: number, frameRms: number): LivePitchFrame {
+  return {
+    time,
+    rms: frameRms,
+    estimatedMidi: null,
+    lockedMidi: null,
+    centsOffset: 0,
+    confidence: 0,
+    voiced: false,
+  }
+}
+
 function triggerFeature(
   attack: number,
   rms: number,
@@ -277,12 +510,73 @@ function triggerFeature(
   return { attack, rms, peak, brightness, noisiness }
 }
 
-function sine(frequency: number, sampleRate: number, frameSize: number): Float32Array {
+function harmonicRichSine(
+  frequency: number,
+  sampleRate: number,
+  frameSize: number,
+): Float32Array {
   const samples = new Float32Array(frameSize)
   for (let index = 0; index < frameSize; index += 1) {
-    samples[index] = Math.sin((Math.PI * 2 * frequency * index) / sampleRate) * 0.7
+    const phase = (Math.PI * 2 * frequency * index) / sampleRate
+    samples[index] =
+      Math.sin(phase) * 0.32 +
+      Math.sin(phase * 2) * 0.78 +
+      Math.sin(phase * 3) * 0.18
   }
   return samples
+}
+
+function sine(
+  frequency: number,
+  sampleRate: number,
+  frameSize: number,
+  amplitude = 0.7,
+): Float32Array {
+  const samples = new Float32Array(frameSize)
+  for (let index = 0; index < frameSize; index += 1) {
+    samples[index] = Math.sin((Math.PI * 2 * frequency * index) / sampleRate) * amplitude
+  }
+  return samples
+}
+
+function clipWithLiveNotes(
+  profile: ReturnType<typeof createDefaultProfile>,
+  notes: ReturnType<typeof adjustedNote>[],
+) {
+  return cleanupCapturedClip({
+    duration: Math.max(...notes.map((note) => note.start + note.duration), 0),
+    frames: [],
+    profile,
+    events: notes.flatMap((note) => [
+      { id: `${note.id}-on`, type: 'noteOn' as const, time: note.start, midi: note.midi, velocity: note.velocity },
+      { id: `${note.id}-off`, type: 'noteOff' as const, time: note.start + note.duration, midi: note.midi },
+    ]),
+  })
+}
+
+function adjustedNote(
+  id: string,
+  start: number,
+  duration: number,
+  midi: number,
+  velocity: number,
+  confidence: number,
+) {
+  return {
+    id,
+    rawId: id,
+    start,
+    duration,
+    quantizedStart: start,
+    quantizedDuration: duration,
+    rawMidi: midi,
+    midi,
+    rawNoteName: `midi-${midi}`,
+    noteName: `midi-${midi}`,
+    velocity,
+    confidence,
+    pitchBends: [0.1],
+  }
 }
 
 function detectedNote(

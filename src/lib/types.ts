@@ -104,6 +104,7 @@ export interface VocalCalibration {
   noiseFloorRms: number
   vocalRms: number
   rmsThreshold: number
+  inputLevel: number
   minMidi: number
   maxMidi: number
   yinThreshold: number
